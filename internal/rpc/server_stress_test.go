@@ -455,7 +455,7 @@ func TestCheckSafeToMineIdleGoroutineStability(t *testing.T) {
 
 	cfg := config.MiningConfig{}
 	for i := 0; i < callCount; i++ {
-		_ = s.checkSafeToMine(cfg, false)
+		_ = s.checkSafeToMine(s.defaultWallet(), cfg, false)
 		if g := runtime.NumGoroutine(); g > maxG {
 			maxG = g
 		}
@@ -505,7 +505,7 @@ func TestFullMinerStatusHandlerIdleStability(t *testing.T) {
 	}
 
 	for i := 0; i < callCount; i++ {
-		_ = s.minerStatus(cfg, nil, false)
+		_ = s.minerStatus(wal, cfg, nil, false)
 		if g := runtime.NumGoroutine(); g > maxG {
 			maxG = g
 		}
@@ -560,7 +560,7 @@ func TestMinerStatusSnapshotConsistency(t *testing.T) {
 
 	cfg := config.MiningConfig{}
 	for i := 0; i < 100; i++ {
-		out := s.minerStatus(cfg, nil, false)
+		out := s.minerStatus(w, cfg, nil, false)
 
 		gen, _ := out["miner_state_generation"].(int64)
 		consistent, _ := out["snapshot_consistent"].(bool)
@@ -653,7 +653,7 @@ func TestForcedPauseResumeTransitionsConsistent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < cycles; i++ {
-				out := s.minerStatus(cfg, nil, false)
+				out := s.minerStatus(w, cfg, nil, false)
 				cons, _ := out["snapshot_consistent"].(bool)
 				active, _ := out["active_mining"].(bool)
 				wActive := intVal(out, "yespower_worker_contexts_active")

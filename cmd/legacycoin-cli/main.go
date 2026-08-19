@@ -39,6 +39,7 @@ type cliOptions struct {
 	RPCPort       string
 	RPCURL        string
 	DataDir       string
+	Wallet        string
 }
 
 func runCLI(argv []string, stdout io.Writer, stderr io.Writer) error {
@@ -63,6 +64,9 @@ func runCLI(argv []string, stdout io.Writer, stderr io.Writer) error {
 		return fmt.Errorf("rpc request error: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if opts.Wallet != "" {
+		req.Header.Set("X-LegacyCoin-Wallet", opts.Wallet)
+	}
 	if err := applyRPCAuth(req, opts); err != nil {
 		return err
 	}
@@ -128,6 +132,8 @@ func parseGlobalFlags(args []string) (cliOptions, []string, error) {
 			opts.RPCURL, err = needsValue()
 		case "-datadir", "--datadir":
 			opts.DataDir, err = needsValue()
+		case "-wallet", "--wallet":
+			opts.Wallet, err = needsValue()
 		default:
 			rest = append(rest, args[i:]...)
 			return opts, rest, nil
@@ -207,12 +213,18 @@ func printHelp() {
 	fmt.Println("  -rpccookiefile=<path>  explicit RPC cookie path")
 	fmt.Println("  -rpcconnect=<host>     RPC host, default 127.0.0.1")
 	fmt.Println("  -rpcport=<port>        RPC port, default 19556")
+	fmt.Println("  -wallet=<name>         target a specific named wallet")
 	fmt.Println("examples:")
 	fmt.Println("  legacycoin-cli getblockcount")
 	fmt.Println("  legacycoin-cli -datadir=/home/user/.legacycoin getnetworkinfo")
 	fmt.Println("  legacycoin-cli -rpcuser=legacyrpc -rpcpassword=strong_password getnetworkinfo")
 	fmt.Println("  legacycoin-cli getwalletinfo")
-	fmt.Println("  legacycoin-cli getbalance")
+	fmt.Println("  legacycoin-cli -wallet=mywallet getbalance")
+	fmt.Println("  legacycoin-cli -wallet=mywallet getnewaddress")
+	fmt.Println("  legacycoin-cli createwallet savings")
+	fmt.Println("  legacycoin-cli loadwallet savings")
+	fmt.Println("  legacycoin-cli listwallets")
+	fmt.Println("  legacycoin-cli -wallet=savings sendtoaddress <address> 1 --yes")
 	fmt.Println("  legacycoin-cli getwalletsummary")
 	fmt.Println("  legacycoin-cli listtransactions")
 	fmt.Println("  legacycoin-cli listunspent")

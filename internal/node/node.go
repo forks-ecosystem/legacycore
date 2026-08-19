@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -170,7 +171,8 @@ func repairPrettyLogArtifacts(line string, emoji bool) string {
 type Node struct {
 	chain       *blockchain.Chain
 	pool        *mempool.Pool
-	wallet      *wallet.Wallet
+	wallets     map[string]*wallet.Wallet
+	defaultWalletName string
 	p2p         *p2p.Server
 	auth        config.RPCAuth
 	rpcBind     config.RPCBind
@@ -193,6 +195,9 @@ func New() (*Node, error) {
 
 type Options struct {
 	Paths config.RuntimePaths
+	// WalletNames forces loading specific named wallets at startup.
+	// If empty, all wallets found in wallets/ are auto-loaded.
+	WalletNames []string
 }
 
 func NewWithDataDir(dataDir string) (*Node, error) {
@@ -233,6 +238,24 @@ func NewWithOptions(opts Options) (*Node, error) {
 	w, err := wallet.Open(paths.DataDir)
 	if err != nil {
 		return nil, err
+	}
+	wallets := map[string]*wallet.Wallet{"default": w}
+	walletNames := wallet.ListWalletDirs(paths.DataDir)
+	if len(opts.WalletNames) > 0 {
+		walletNames = opts.WalletNames
+	}
+	for _, name := range walletNames {
+		if name == "default" {
+			continue
+		}
+		if !config.IsWalletName(name) {
+			continue
+		}
+		nw, err := wallet.OpenNamed(paths.DataDir, name)
+		if err != nil {
+			return nil, fmt.Errorf("load wallet %q: %w", name, err)
+		}
+		wallets[name] = nw
 	}
 	pool := mempool.New()
 	logCfg, err := config.LoadLogConfig(paths.ConfigPath)
@@ -355,7 +378,7 @@ func NewWithOptions(opts Options) (*Node, error) {
 		}
 		stratumAddr = fmt.Sprintf("0.0.0.0:%d", stratumCfg.Port)
 	}
-	return &Node{chain: chain, pool: pool, wallet: w, p2p: p2pServer, auth: auth, rpcBind: rpcBind, p2pBind: p2pBind, policy: policy, interop: interop, logCfg: logCfg, peerPol: peerPol, paths: paths, stratum: stratumServer, stratumAddr: stratumAddr}, nil
+	return &Node{chain: chain, pool: pool, wallets: wallets, defaultWalletName: "default", p2p: p2pServer, auth: auth, rpcBind: rpcBind, p2pBind: p2pBind, policy: policy, interop: interop, logCfg: logCfg, peerPol: peerPol, paths: paths, stratum: stratumServer, stratumAddr: stratumAddr}, nil
 }
 
 func isLocalhostBind(host string) bool {
@@ -417,7 +440,7 @@ func (n *Node) Run(ctx context.Context, cancel context.CancelFunc) error {
 		errc <- n.p2p.Start(ctx)
 	}()
 	fmt.Printf("Legacy Coin Go node listening on RPC port %d\n", n.chain.Params().RPCPort)
-	server := rpc.New(n.chain, n.pool, n.wallet, n.p2p, cancel, n.auth, n.rpcBind, n.policy, n.paths.ConfigPath)
+	server := rpc.NewMultiWallet(n.chain, n.pool, n.wallets, n.defaultWalletName, n.paths.DataDir, n.p2p, cancel, n.auth, n.rpcBind, n.policy, n.paths.ConfigPath)
 	n.rpcServer = server
 	go func() {
 		errc <- server.ListenAndServe(ctx)
@@ -444,7 +467,79 @@ func (n *Node) Chain() *blockchain.Chain { return n.chain }
 
 func (n *Node) Mempool() *mempool.Pool { return n.pool }
 
-func (n *Node) Wallet() *wallet.Wallet { return n.wallet }
+func (n *Node) Wallet() *wallet.Wallet { return n.wallets[n.defaultWalletName] }
+func (n *Node) defaultWallet() *wallet.Wallet { return n.wallets[n.defaultWalletName] }
+
+// WalletByName returns the named wallet. If name is empty, the default wallet is returned.
+func (n *Node) WalletByName(name string) *wallet.Wallet {
+	if name == "" {
+		return n.wallets[n.defaultWalletName]
+	}
+	return n.wallets[name]
+}
+
+// WalletNames returns all loaded wallet names sorted.
+func (n *Node) WalletNames() []string {
+	names := make([]string, 0, len(n.wallets))
+	for k := range n.wallets {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// LoadWallet loads a named wallet at runtime from the wallets/ directory.
+func (n *Node) LoadWallet(name string) error {
+	if !config.IsWalletName(name) {
+		return fmt.Errorf("invalid wallet name: %q", name)
+	}
+	if _, ok := n.wallets[name]; ok {
+		return fmt.Errorf("wallet %q already loaded", name)
+	}
+	nw, err := wallet.OpenNamed(n.paths.DataDir, name)
+	if err != nil {
+		return err
+	}
+	n.wallets[name] = nw
+	return nil
+}
+
+// UnloadWallet unloads a named wallet. The default wallet cannot be unloaded.
+func (n *Node) UnloadWallet(name string) error {
+	if name == "" {
+		name = n.defaultWalletName
+	}
+	if name == n.defaultWalletName {
+		return fmt.Errorf("cannot unload the default wallet")
+	}
+	if _, ok := n.wallets[name]; !ok {
+		return fmt.Errorf("wallet %q not loaded", name)
+	}
+	delete(n.wallets, name)
+	return nil
+}
+
+// CreateWallet creates a new named wallet directory and loads it.
+func (n *Node) CreateWallet(name string) (*wallet.Wallet, error) {
+	if !config.IsWalletName(name) {
+		return nil, fmt.Errorf("invalid wallet name: %q", name)
+	}
+	if _, ok := n.wallets[name]; ok {
+		return nil, fmt.Errorf("wallet %q already loaded", name)
+	}
+	nw, err := wallet.OpenNamed(n.paths.DataDir, name)
+	if err != nil {
+		return nil, err
+	}
+	n.wallets[name] = nw
+	return nw, nil
+}
+
+// HasWallet reports whether a wallet with the given name is loaded.
+func (n *Node) HasWallet(name string) bool {
+	_, ok := n.wallets[name]
+	return ok
+}
 
 func (n *Node) P2P() *p2p.Server { return n.p2p }
 
@@ -464,7 +559,7 @@ func (n *Node) printStartupBanner() {
 		best = tip.Hash
 	}
 	storage := n.chain.StorageHealth()
-	winfo := n.wallet.SecurityInfo()
+	winfo := n.defaultWallet().SecurityInfo()
 	fmt.Println("╔════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║  🪙 Legacy Coin Node                                          ║")
 	fmt.Println("║  onecpuonevote • Satoshi legacy • CPU-friendly PoW            ║")
@@ -475,7 +570,7 @@ func (n *Node) printStartupBanner() {
 	fmt.Printf("║  Height       %-48d║\n", height)
 	fmt.Printf("║  P2P          %-48d║\n", n.chain.Params().DefaultPort)
 	fmt.Printf("║  RPC          %-48s║\n", n.rpcBind.Host+":"+fmt.Sprint(n.chain.Params().RPCPort))
-	fmt.Printf("║  Wallet       encrypted=%t locked=%t                         ║\n", winfo["encrypted"], winfo["locked"])
+	fmt.Printf("║  Wallet       encrypted=%t locked=%t [%d loaded]            ║\n", winfo["encrypted"], winfo["locked"], len(n.wallets))
 	fmt.Printf("║  Storage      ok=%t                                         ║\n", storage.OK)
 	fmt.Println("╚════════════════════════════════════════════════════════════════╝")
 	if best != "" {

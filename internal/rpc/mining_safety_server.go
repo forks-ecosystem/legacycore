@@ -10,9 +10,10 @@ import (
 	"legacycoin/legacy-go/internal/mining"
 	"legacycoin/legacy-go/internal/p2p"
 	"legacycoin/legacy-go/internal/version"
+	"legacycoin/legacy-go/internal/wallet"
 )
 
-func (s *Server) checkSafeToMine(cfg config.MiningConfig, requireDestination bool) MiningSafetyStatus {
+func (s *Server) checkSafeToMine(w *wallet.Wallet, cfg config.MiningConfig, requireDestination bool) MiningSafetyStatus {
 	input := MiningSafetyInput{
 		RPCHealth:           "ok",
 		StorageOK:           true,
@@ -39,7 +40,7 @@ func (s *Server) checkSafeToMine(cfg config.MiningConfig, requireDestination boo
 		}
 	}
 	if requireDestination {
-		dest := s.miningDestinationStatus(cfg)
+		dest := s.miningDestinationStatus(w, cfg)
 		input.DestinationOK = dest.Owned || dest.External
 		input.DestinationError = dest.Error
 	}
@@ -436,7 +437,7 @@ func miningPeerSetSplit(peers []p2p.PeerInfo) bool {
 
 func (s *Server) chainStatus() map[string]any {
 	cfg, _ := config.LoadMiningConfig(s.miningConfigPath())
-	safety := s.checkSafeToMine(cfg, false)
+	safety := s.checkSafeToMine(s.defaultWallet(), cfg, false)
 	localHash := ""
 	currentBits := ""
 	lastBlockAge := float64(-1)

@@ -61,7 +61,7 @@ func printUsage() {
 
 Usage:
   legacycoind help
-  legacycoind run [-seednode] [-addnode ip:port] [-connect ip:port] [-noseednode] [-seed-peers] [-datadir path] [-p2pport port] [-rpcport port]
+  legacycoind run [-seednode] [-addnode ip:port] [-connect ip:port] [-noseednode] [-seed-peers] [-datadir path] [-wallet name] [-p2pport port] [-rpcport port]
   legacycoind params
   legacycoind genesis [threads]
   legacycoind reindex [-datadir path]
@@ -412,6 +412,17 @@ func applyRuntimeNodeFlags(args []string) error {
 			if err := config.AppendConfigLine(config.DefaultConfigPath(), "stratum_diff", strings.TrimSpace(val)); err != nil {
 				return err
 			}
+		case "-wallet", "--wallet":
+			if !hasEq {
+				i++
+				if i >= len(args) {
+					return fmt.Errorf("%s requires value", key)
+				}
+				val = args[i]
+			}
+			if err := os.Setenv("LEGACYCOIN_WALLET", strings.TrimSpace(val)); err != nil {
+				return err
+			}
 		case "":
 			continue
 		default:
@@ -458,7 +469,11 @@ func runNode() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	n, err := node.New()
+	opts := node.Options{Paths: config.DefaultRuntimePaths()}
+	if walletName := os.Getenv("LEGACYCOIN_WALLET"); walletName != "" {
+		opts.WalletNames = []string{walletName}
+	}
+	n, err := node.NewWithOptions(opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create node: %v\n", err)
 		os.Exit(1)

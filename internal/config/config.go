@@ -720,6 +720,28 @@ func AppendConfigLine(path, key, value string) error {
 	return os.Rename(tmp, cleanPath)
 }
 
+// WalletsDir returns the path to the wallets/ subdirectory inside the given data dir.
+func WalletsDir(dataDir string) string {
+	return filepath.Join(dataDir, "wallets")
+}
+
+// WalletDirForName returns the path for a named wallet directory inside dataDir/wallets/{name}.
+func WalletDirForName(dataDir string, name string) string {
+	return filepath.Join(WalletsDir(dataDir), filepath.Clean(name))
+}
+
+// IsWalletName validates that name is a safe single path component suitable for a wallet directory.
+func IsWalletName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, "/\\") {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
 type PeerPolicy struct {
 	ChainID                 string
 	EnforceChainID          bool

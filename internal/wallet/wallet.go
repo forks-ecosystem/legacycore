@@ -26,6 +26,7 @@ import (
 	"legacycoin/legacy-go/internal/blockchain"
 	"legacycoin/legacy-go/internal/chaincfg"
 	"legacycoin/legacy-go/internal/chainhash"
+	"legacycoin/legacy-go/internal/config"
 	"legacycoin/legacy-go/internal/fsutil"
 	"legacycoin/legacy-go/internal/mempool"
 	"legacycoin/legacy-go/internal/pqc"
@@ -148,6 +149,34 @@ func Open(dataDir string) (*Wallet, error) {
 		return nil, err
 	}
 	return w, nil
+}
+
+// OpenNamed opens a named wallet from dataDir/wallets/{name}/wallet.json.
+// The wallet file is created if it does not exist.
+func OpenNamed(dataDir string, name string) (*Wallet, error) {
+	walletDir := config.WalletDirForName(dataDir, name)
+	return Open(walletDir)
+}
+
+// ListWalletDirs returns the names of subdirectories under dataDir/wallets/ that contain a wallet.json file.
+func ListWalletDirs(dataDir string) []string {
+	walletsDir := config.WalletsDir(dataDir)
+	entries, err := os.ReadDir(walletsDir)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		walletFile := filepath.Join(walletsDir, e.Name(), "wallet.json")
+		if _, err := os.Stat(walletFile); err == nil {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (w *Wallet) NewHybridAddress() (string, error) {

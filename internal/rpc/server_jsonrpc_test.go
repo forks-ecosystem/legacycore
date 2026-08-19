@@ -234,7 +234,7 @@ func TestResolveMiningDestinationRejectsStaleUnownedHash(t *testing.T) {
 	}
 	s := &Server{wallet: w, configPath: filepath.Join(dir, config.ConfigFile)}
 	cfg := config.MiningConfig{PubKeyHash: "85f774538db4b5243fe64121bbfe53bc83441e0e"}
-	dest, err := s.resolveMiningDestination(cfg, true)
+	dest, err := s.resolveMiningDestination(w, cfg, true)
 	if err == nil {
 		t.Fatalf("expected stale unowned hash to be rejected, got %+v", dest)
 	}
