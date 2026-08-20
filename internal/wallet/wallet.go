@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -102,6 +103,24 @@ type UTXOView struct {
 	PkScriptHex   string `json:"pk_script_hex,omitempty"`
 }
 
+func encodeMnemonic(m string) string {
+	if m == "" {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString([]byte(m))
+}
+
+func decodeMnemonic(s string) string {
+	if s == "" {
+		return ""
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return s
+	}
+	return string(b)
+}
+
 func Open(dataDir string) (*Wallet, error) {
 	path := filepath.Join(dataDir, "wallet.json")
 	w := &Wallet{
@@ -136,7 +155,7 @@ func Open(dataDir string) (*Wallet, error) {
 				w.hybridKeys = s.HybridKeys
 			}
 			w.seedHex = s.SeedHex
-			w.mnemonic = s.Mnemonic
+			w.mnemonic = decodeMnemonic(s.Mnemonic)
 			w.nextIndex = s.NextIndex
 			w.refreshMetadataLocked()
 		}
@@ -241,7 +260,7 @@ func (w *Wallet) SetHDSeed(seedHex string) (string, error) {
 		_ = mnem // store below
 	} else {
 		if bip39.IsMnemonicValid(seedHex) {
-			decoded, err := bip39.MnemonicToByteArray(seedHex)
+			decoded, err := bip39.EntropyFromMnemonic(seedHex)
 			if err != nil || len(decoded) < 16 {
 				return "", fmt.Errorf("invalid mnemonic phrase")
 			}
@@ -1278,7 +1297,7 @@ func (w *Wallet) persist() error {
 	s.Addresses = sortedAddressKeys(w.addresses)
 	s.HybridAddresses = sortedAddressKeys(w.hybridAddrs)
 	s.SeedHex = w.seedHex
-	s.Mnemonic = w.mnemonic
+	s.Mnemonic = encodeMnemonic(w.mnemonic)
 	s.NextIndex = w.nextIndex
 	s.ClassicKeyCount = uint32(len(w.keys))
 	s.HybridKeyCount = uint32(len(w.hybridKeys))
