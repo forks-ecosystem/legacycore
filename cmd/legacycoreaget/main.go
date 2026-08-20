@@ -240,6 +240,12 @@ func (s *Service) handleGetWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasSuffix(path, "/newhybridaddress") && r.Method == http.MethodPost {
+		name := strings.TrimSuffix(path, "/newhybridaddress")
+		s.handleNewHybridAddress(w, r, name)
+		return
+	}
+
 	if strings.HasSuffix(path, "/balance") {
 		name := strings.TrimSuffix(path, "/balance")
 		s.handleGetBalance(w, r, name)
@@ -344,6 +350,40 @@ func (s *Service) handleNewAddress(w http.ResponseWriter, r *http.Request, name 
 	jsonResp(w, 200, map[string]any{
 		"wallet":   name,
 		"address":  addr,
+	})
+}
+
+// POST /api/wallet/{name}/newhybridaddress
+func (s *Service) handleNewHybridAddress(w http.ResponseWriter, r *http.Request, name string) {
+	dir := s.resolveDir(name)
+	if _, err := os.Stat(filepath.Join(dir, "wallet.json")); os.IsNotExist(err) {
+		jsonErr(w, 404, "wallet not found")
+		return
+	}
+
+	wal, err := wallet.Open(dir)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+
+	info := wal.SecurityInfo()
+	if !info["hdseed"].(bool) {
+		if _, err := wal.SetHDSeed(""); err != nil {
+			jsonErr(w, 500, "set seed: "+err.Error())
+			return
+		}
+	}
+
+	addr, err := wal.NewHybridAddress()
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+
+	jsonResp(w, 200, map[string]any{
+		"wallet":  name,
+		"address": addr,
 	})
 }
 
