@@ -512,7 +512,7 @@ func main() {
 
 	addr := host + ":" + port
 	fmt.Println("========================================")
-	fmt.Println("  legacycoreaget - Wallet API Service")
+	fmt.Println("  legacycoreagent - Wallet API Service")
 	fmt.Println("========================================")
 	fmt.Printf("  Port:   %s\n", port)
 	fmt.Printf("  Host:   %s\n", host)
