@@ -399,7 +399,8 @@ func (s *Service) handleListWallets(w http.ResponseWriter, r *http.Request) {
 	entries, err := os.ReadDir(walletsDir)
 	if err == nil {
 		for _, e := range entries {
-			if e.IsDir() {
+			// "default" is the root wallet (/data/wallet.json), skip nested default dir
+			if e.IsDir() && e.Name() != "default" {
 				names = append(names, e.Name())
 			}
 		}
