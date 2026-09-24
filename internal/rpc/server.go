@@ -181,6 +181,12 @@ func (s *Server) checkRateLimit(ip string) bool {
 	if s.disableRateLimit {
 		return true
 	}
+	// Per-client IP token bucket (default). Loopback-only RPC deployments with
+	// several local consumers (explorer, pool, wallet agent, monitors) starve
+	// the shared 127.0.0.1 bucket; set LEGACYCOIN_RPC_RATE_LIMIT=0 to disable.
+	if os.Getenv("LEGACYCOIN_RPC_RATE_LIMIT") == "0" {
+		return true
+	}
 	v, _ := s.rateLimiters.LoadOrStore(ip, newRateLimiter(60, time.Second))
 	return v.(*rateLimiter).allow()
 }
@@ -561,6 +567,20 @@ func (s *Server) resolveWalletName(ctx context.Context) string {
 		}
 	}
 	return s.defaultWalletName
+}
+
+// ownsAddress reports whether any loaded wallet owns addr. Composite wallets
+// (default + exchange + mainer + pool) are all considered, so validateaddress/
+// getaddressinfo return ismine=true for addresses living in a non-default wallet.
+func (s *Server) ownsAddress(addr string) bool {
+	for _, w := range s.wallets {
+		for _, owned := range w.ListAddresses() {
+			if owned == addr {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) miningConfigPath() string {
@@ -2733,11 +2753,8 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 			pubHashHex = hex.EncodeToString(payload)
 		}
 		ismine := false
-		for _, owned := range w.ListAddresses() {
-			if owned == addr {
-				ismine = true
-				break
-			}
+		if s.ownsAddress(addr) {
+			ismine = true
 		}
 		return map[string]any{
 			"isvalid":         isValid,

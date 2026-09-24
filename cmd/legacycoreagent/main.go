@@ -10,8 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
+	"legacycoin/legacy-go/internal/txsvc"
 	"legacycoin/legacy-go/internal/wallet"
 )
 
@@ -20,14 +23,22 @@ type Service struct {
 	rpcURL  string
 	rpcUser string
 	rpcPass string
+	chains  *txsvc.Manager
+	apiKey  string
 }
 
 func NewService(dataDir string) *Service {
+	rpcURL := getEnv("LEGACYCOIN_RPC_URL", "")
+	rpcUser := getEnv("LEGACYCOIN_RPC_USER", "")
+	rpcPass := getEnv("LEGACYCOIN_RPC_PASS", "")
+
 	return &Service{
 		dataDir: dataDir,
-		rpcURL:  getEnv("LEGACYCOIN_RPC_URL", ""),
-		rpcUser: getEnv("LEGACYCOIN_RPC_USER", ""),
-		rpcPass: getEnv("LEGACYCOIN_RPC_PASS", ""),
+		rpcURL:  rpcURL,
+		rpcUser: rpcUser,
+		rpcPass: rpcPass,
+		chains:  txsvc.NewManager(),
+		apiKey:  getEnv("LEGACYCOIN_API_KEY", ""),
 	}
 }
 
@@ -53,6 +64,22 @@ func jsonErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func (s *Service) rpcCall(method string, params any) (any, error) {
+	// The node rate-limits RPC (token bucket ~60/s burst, 1/s sustained, per
+	// client IP). Retry with a 1s delay so bursts of getaddressbalance calls
+	// drain into the bucket instead of returning zeros.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		res, err := s.rpcCallOnce(method, params)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		time.Sleep(time.Second)
+	}
+	return nil, lastErr
+}
+
+func (s *Service) rpcCallOnce(method string, params any) (any, error) {
 	if s.rpcURL == "" {
 		return nil, fmt.Errorf("RPC not configured")
 	}
@@ -495,6 +522,197 @@ func (s *Service) handleGetBalances(w http.ResponseWriter, r *http.Request, name
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Transaction Service API (Phase 1 - read-only, Phase 2 - send)
+//   GET  /api/chain/{coin}/balance/{address}
+//   GET  /api/chain/{coin}/utxos/{address}[?minconf=N]
+//   GET  /api/chain/{coin}/validate/{address}
+//   GET  /api/chain/{coin}/history/{address}
+//   POST /api/chain/{coin}/send        body {from,to,amount,fee,privateKey}
+// ---------------------------------------------------------------------------
+
+func (s *Service) handleChain(w http.ResponseWriter, r *http.Request) {
+	// /api/chain/{coin}/{op}[/{address}]
+	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/api/chain/"), "/", 3)
+	if len(parts) != 2 && len(parts) != 3 {
+		jsonErr(w, 400, "expected /api/chain/{coin}/{op}[/{address}]")
+		return
+	}
+	coin, op := parts[0], parts[1]
+	rest := ""
+	if len(parts) == 3 {
+		rest = parts[2]
+	}
+	chain, err := s.chains.Get(coin)
+	if err != nil {
+		jsonErr(w, 404, err.Error())
+		return
+	}
+
+	switch op {
+	case "balance":
+		s.handleChainBalance(w, chain, rest)
+	case "utxos":
+		s.handleChainUtxos(w, r, chain, rest)
+	case "validate":
+		s.handleChainValidate(w, chain, rest)
+	case "history":
+		s.handleChainHistory(w, chain, rest)
+	case "estimate":
+		s.handleChainEstimate(w, r, chain, rest)
+	case "send":
+		s.handleChainSend(w, r, chain, rest)
+	default:
+		jsonErr(w, 400, "unknown op "+op)
+	}
+}
+
+func (s *Service) handleChainBalance(w http.ResponseWriter, chain txsvc.Blockchain, address string) {
+	bal, err := chain.GetBalance(address)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	jsonResp(w, 200, bal)
+}
+
+func (s *Service) handleChainUtxos(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address string) {
+	minConf := 1
+	if q := r.URL.Query().Get("minconf"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n >= 0 {
+			minConf = n
+		}
+	}
+	utxos, err := chain.ListUnspent(address, minConf)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if utxos == nil {
+		utxos = []txsvc.UTXO{}
+	}
+	jsonResp(w, 200, map[string]any{
+		"address": address,
+		"count":   len(utxos),
+		"utxos":   utxos,
+	})
+}
+
+func (s *Service) handleChainValidate(w http.ResponseWriter, chain txsvc.Blockchain, address string) {
+	info, err := chain.ValidateAddress(address)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	jsonResp(w, 200, info)
+}
+
+func (s *Service) handleChainHistory(w http.ResponseWriter, chain txsvc.Blockchain, address string) {
+	entries, err := chain.GetHistory(address)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []txsvc.HistoryEntry{}
+	}
+	jsonResp(w, 200, map[string]any{
+		"address": address,
+		"count":   len(entries),
+		"entries": entries,
+	})
+}
+
+// handleChainSend signs and broadcasts a withdrawal. body:
+// {"from":addr,"to":addr,"amount":baseUnits,"fee":baseUnitsOr0,"privateKey":"0x..."}
+// Requires the X-Api-Key header matching LEGACYCOIN_API_KEY so that browser
+// clients hitting the public nginx proxy cannot submit signed sends.
+func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address string) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "send requires POST")
+		return
+	}
+	if s.apiKey != "" && r.Header.Get("X-Api-Key") != s.apiKey {
+		jsonErr(w, 401, "missing or invalid X-Api-Key")
+		return
+	}
+	var req struct {
+		From       string `json:"from"`
+		To         string `json:"to"`
+		Amount     int64  `json:"amount"`
+		Fee        int64  `json:"fee"`
+		PrivateKey string `json:"privateKey"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, 400, "invalid json")
+		return
+	}
+	if req.From == "" {
+		jsonErr(w, 400, "from is required")
+		return
+	}
+	if address != "" && req.From != address {
+		jsonErr(w, 400, "path/from address mismatch")
+		return
+	}
+	res, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	jsonResp(w, 200, res)
+}
+
+// handleChainEstimate returns a dry-run fee estimate for a pending send. It is
+// safe to expose without an API key: it never signs or broadcasts and reveals
+// nothing beyond what balance/utxos already expose.
+func (s *Service) handleChainEstimate(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address string) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "estimate requires POST")
+		return
+	}
+	var req struct {
+		From       string `json:"from"`
+		To         string `json:"to"`
+		Amount     int64  `json:"amount"`
+		PrivateKey string `json:"privateKey"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonErr(w, 400, "invalid json")
+		return
+	}
+	if req.From == "" {
+		jsonErr(w, 400, "from is required")
+		return
+	}
+	if address != "" && req.From != address {
+		jsonErr(w, 400, "path/from address mismatch")
+		return
+	}
+	if req.PrivateKey != "" {
+		if pe, ok := chain.(txsvc.ProbeEstimator); ok {
+			res, err := pe.EstimateWithKey(req.From, req.To, req.Amount, req.PrivateKey)
+			if err != nil {
+				jsonErr(w, 500, err.Error())
+				return
+			}
+			jsonResp(w, 200, res)
+			return
+		}
+	}
+	est, ok := chain.(txsvc.Estimator)
+	if !ok {
+		jsonErr(w, 404, "coin does not support estimation")
+		return
+	}
+	res, err := est.Estimate(req.From, req.To, req.Amount)
+	if err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	jsonResp(w, 200, res)
+}
+
 func main() {
 	dataDir := getEnv("LEGACYCOIN_DATADIR", "/data")
 	host := getEnv("LEGACYCOIN_HOST", "0.0.0.0")
@@ -506,10 +724,27 @@ func main() {
 
 	svc := NewService(dataDir)
 
+	signer := getEnv("LEGACYCOIN_SIGNER_URL", "http://127.0.0.1:8053")
+	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("KAS", "https://api.kaspa.org").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("GOR", "https://api.gor.forks.life").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("BTM", "https://api.btm.forks.life").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("BRICS", "https://api.brics.forks.life").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("CAS", "https://api.cas.forks.life").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewKaspaRest("KASV2", "https://api.kasv2.forks.life").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewBitcoin("https://blockstream.info/api").SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewEtherscanReads("ETH", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
+	svc.chains.Register(txsvc.NewEtherscanReads("USDT", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
+	svc.chains.Register(txsvc.NewEtherscanReads("XHT", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
+	svc.chains.Register(txsvc.NewSolanaReads("SOL"))
+	svc.chains.Register(txsvc.NewSolanaReads("TRUMP"))
+	svc.chains.Register(txsvc.NewTronReads("TRX"))
+
 	http.HandleFunc("/api/generate-seed", svc.handleGenerateSeed)
 	http.HandleFunc("/api/restore-wallet", svc.handleRestoreWallet)
 	http.HandleFunc("/api/wallet/", svc.handleGetWallet)
 	http.HandleFunc("/api/wallets", svc.handleListWallets)
+	http.HandleFunc("/api/chain/", svc.handleChain)
 
 	addr := host + ":" + port
 	fmt.Println("========================================")
@@ -529,6 +764,13 @@ func main() {
 	fmt.Println("    GET  /api/wallet/{name}/balance")
 	fmt.Println("    GET  /api/wallet/{name}/balances")
 	fmt.Println("    GET  /api/wallets")
+	fmt.Println("  Transaction Service (read-only):")
+	fmt.Println("    GET  /api/chain/{coin}/balance/{address}")
+	fmt.Println("    GET  /api/chain/{coin}/utxos/{address}?minconf=N")
+	fmt.Println("    GET  /api/chain/{coin}/validate/{address}")
+	fmt.Println("    GET  /api/chain/{coin}/history/{address}")
+	fmt.Println("    POST /api/chain/{coin}/estimate (from,to,amount) -> fee/change")
+	fmt.Println("    POST /api/chain/{coin}/send     (requires X-Api-Key)")
 	fmt.Println("========================================")
 
 	log.Fatal(http.ListenAndServe(addr, nil))

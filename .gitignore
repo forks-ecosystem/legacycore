@@ -37,3 +37,4 @@ TEST-BUILD-*
 
 # Local blockchain data
 data/
+/legacycoreagent
