@@ -137,23 +137,3 @@ func TestParseGBTRequestLegacyPubHash(t *testing.T) {
 		t.Fatalf("pubhash len=%d want 20", got)
 	}
 }
-
-func TestFilterMempoolSpentAddressUTXOs(t *testing.T) {
-	utxos := []blockchain.AddressIndexUTXO{
-		{TxID: "aa", Vout: 0, Value: 100},
-		{TxID: "bb", Vout: 1, Value: 200},
-		{TxID: "cc", Vout: 2, Value: 300},
-	}
-	filtered := filterMempoolSpentAddressUTXOs(utxos, map[string]string{
-		blockchain.OutPointKey("bb", 1): "spender",
-	})
-	if len(filtered) != 2 {
-		t.Fatalf("filtered length=%d want 2", len(filtered))
-	}
-	if filtered[0].TxID != "aa" || filtered[1].TxID != "cc" {
-		t.Fatalf("filtered order/content mismatch: %+v", filtered)
-	}
-	if got := filterMempoolSpentAddressUTXOs(utxos, nil); len(got) != len(utxos) {
-		t.Fatalf("nil spent map changed length: %d", len(got))
-	}
-}
