@@ -433,6 +433,20 @@ func rpcSendError(err error) string {
 	}
 }
 
+func filterMempoolSpentAddressUTXOs(utxos []blockchain.AddressIndexUTXO, spent map[string]string) []blockchain.AddressIndexUTXO {
+	if len(spent) == 0 {
+		return utxos
+	}
+	filtered := make([]blockchain.AddressIndexUTXO, 0, len(utxos))
+	for _, u := range utxos {
+		if _, ok := spent[blockchain.OutPointKey(u.TxID, u.Vout)]; ok {
+			continue
+		}
+		filtered = append(filtered, u)
+	}
+	return filtered
+}
+
 func rpcIsLocalhost(host string) bool {
 	switch host {
 	case "127.0.0.1", "localhost", "::1":
@@ -1625,6 +1639,9 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 		utxos, err := s.chain.AddressUTXOs(args[0])
 		if err != nil {
 			return nil, &rpcError{Code: -5, Message: err.Error()}
+		}
+		if s.pool != nil {
+			utxos = filterMempoolSpentAddressUTXOs(utxos, s.pool.SpentOutpoints())
 		}
 		return utxos, nil
 	case "getaddressbalance":
