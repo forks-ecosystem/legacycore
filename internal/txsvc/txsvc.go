@@ -25,9 +25,9 @@ var ErrNotImplemented = errors.New("not implemented")
 
 // TxOptions carries per-send parameters understood by all chains.
 type TxOptions struct {
-	FeeRate              float64 // satoshis/KB, sompi/KB, gas price, ...
+	FeeRate               float64 // satoshis/KB, sompi/KB, gas price, ...
 	SubtractFeeFromAmount bool
-	Comment              string
+	Comment               string
 }
 
 // Tx is the normalized transaction view returned to PHP.
@@ -54,12 +54,12 @@ type UTXO struct {
 
 // Balance is a normalized address balance in base units and display units.
 type Balance struct {
-	Address            string  `json:"address"`
-	BalanceBaseUnits   int64   `json:"balance_base_units"`
-	Balance            float64 `json:"balance"`
-	ReceivedBaseUnits  int64   `json:"received_base_units"`
-	Received           float64 `json:"received"`
-	Confirmed          bool    `json:"confirmed"`
+	Address           string  `json:"address"`
+	BalanceBaseUnits  int64   `json:"balance_base_units"`
+	Balance           float64 `json:"balance"`
+	ReceivedBaseUnits int64   `json:"received_base_units"`
+	Received          float64 `json:"received"`
+	Confirmed         bool    `json:"confirmed"`
 }
 
 // AddrInfo is the normalized result of address validation.
@@ -76,7 +76,7 @@ type HistoryEntry struct {
 	Txid          string `json:"txid"`
 	Height        int64  `json:"height"`
 	Confirmations int64  `json:"confirmations"`
-	Type          string `json:"type"` // receive | send
+	Type          string `json:"type"`   // receive | send
 	Amount        int64  `json:"amount"` // base units
 	AmountDisplay string `json:"amount_display"`
 	Coinbase      bool   `json:"coinbase"`
@@ -85,18 +85,19 @@ type HistoryEntry struct {
 
 // SendResult is the outcome of a signed-and-broadcast transaction.
 type SendResult struct {
-	Txid  string `json:"txid"`
-	Fee   int64  `json:"fee"` // base units actually paid
-	RawTx string `json:"raw_tx"`
-	Size  int    `json:"size"` // tx serialized size in bytes
+	Txid   string `json:"txid"`
+	Fee    int64  `json:"fee"` // base units actually paid
+	RawTx  string `json:"raw_tx"`
+	Size   int    `json:"size"` // tx serialized size in bytes
+	Amount int64  `json:"amount,omitempty"`
 }
 
 // FeeEstimate is the result of a dry-run fee calculation (no signing).
 type FeeEstimate struct {
-	Fee    int64  `json:"fee"`    // minimum relay fee, base units
-	Change int64  `json:"change"` // base units returned to sender
-	Inputs int    `json:"inputs"` // number of inputs used
-	Size   int    `json:"size"`   // expected tx size in bytes
+	Fee    int64 `json:"fee"`    // minimum relay fee, base units
+	Change int64 `json:"change"` // base units returned to sender
+	Inputs int   `json:"inputs"` // number of inputs used
+	Size   int   `json:"size"`   // expected tx size in bytes
 }
 
 // Blockchain is the per-coin interface. Implementations talk to a node RPC
@@ -131,7 +132,7 @@ type Blockchain interface {
 	// SignAndSend builds, signs and broadcasts a transaction using an
 	// externally provided private key (self-custody wallets). fee<=0 asks the
 	// chain to pick the minimum fee. Returns the normalized send result.
-	SignAndSend(from, to string, amount, fee int64, privateKey string) (SendResult, error)
+	SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error)
 }
 
 // Manager routes requests to the registered coin implementations by name.
@@ -211,8 +212,8 @@ func (c *RPCClient) callOnce(method string, params any) (any, error) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	var result struct {
-		Result any    `json:"result"`
-		Error  any    `json:"error"`
+		Result any `json:"result"`
+		Error  any `json:"error"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, err

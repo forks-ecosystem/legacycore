@@ -175,9 +175,22 @@ func NewBlockTemplate(chain *blockchain.Chain, pool *mempool.Pool, pubKeyHash []
 	selected := make([]*wire.MsgTx, 0)
 	if pool != nil {
 		entries := pool.Entries()
+		// A mempool entry is only usable when all of its inputs still resolve,
+		// either against the confirmed UTXO set or against a mempool
+		// transaction already selected for this template. Entries that cannot be
+		// built are skipped instead of being copied into the template verbatim:
+		// a single unbuildable transaction would make the whole block
+		// unminable (bad-txns-inputs-missingorspent) and stop the pool.
+		included := make(map[string]struct{})
 		for _, entry := range entries {
+			if !templateTxIsBuildable(chain, entry.Tx, included, height) {
+				continue
+			}
 			totalFees += entry.Fee
 			selected = append(selected, entry.Tx)
+			if txHash, err := entry.Tx.TxHash(); err == nil {
+				included[txHash.String()] = struct{}{}
+			}
 		}
 	}
 	coinbase, err := NewCoinbaseTx(height, pubKeyHash, chaincfg.BlockSubsidy(height)+totalFees)
@@ -208,6 +221,30 @@ func NewBlockTemplate(chain *blockchain.Chain, pool *mempool.Pool, pubKeyHash []
 	}
 	block.Header.MerkleRoot = root
 	return block, height, nil
+}
+
+// templateTxIsBuildable reports whether tx can be included in a block on top of
+// the current tip. Every input has to resolve to a confirmed UTXO that is
+// spendable at the given height, or to a mempool transaction that was already
+// selected for this template.
+func templateTxIsBuildable(chain *blockchain.Chain, tx *wire.MsgTx, included map[string]struct{}, height int32) bool {
+	if len(tx.TxIn) == 0 {
+		return false
+	}
+	for _, in := range tx.TxIn {
+		parentTxID := in.PreviousOutPoint.Hash.String()
+		if _, ok := included[parentTxID]; ok {
+			continue
+		}
+		prev, err := chain.UTXO(parentTxID, in.PreviousOutPoint.Index)
+		if err != nil {
+			return false
+		}
+		if prev.Coinbase && height-prev.Height < int32(chaincfg.CoinbaseMaturity) {
+			return false
+		}
+	}
+	return true
 }
 
 func NewCoinbaseTx(height int32, pubKeyHash []byte, value int64) (*wire.MsgTx, error) {

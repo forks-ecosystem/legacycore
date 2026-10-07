@@ -598,6 +598,13 @@ func (s *FileStore) RepairIndexes() error {
 	if err := s.rebuildHashIndexFromActiveTip(); err != nil {
 		return err
 	}
+	// The UTXO set is not an optional index: gettxout, getaddressutxo and
+	// gettxoutsetinfo all read it, so a partial or stale set silently answers
+	// "block not found" for outputs that are in fact unspent. It is rebuilt from
+	// the same block data the other indexes use.
+	if err := s.rebuildUTXOFromActiveTip(); err != nil {
+		return err
+	}
 	return s.rebuildOptionalIndexesFromActiveTip()
 }
 
@@ -620,6 +627,72 @@ func (s *FileStore) rebuildHashIndexFromActiveTip() error {
 		}
 		if err := fsutil.WriteFileAtomic(s.hashIndexPath(idx.Hash), b, 0600); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *FileStore) rebuildUTXOFromActiveTip() error {
+	tip, err := s.readTipNoRecover()
+	if err != nil {
+		return err
+	}
+	if tip == nil || tip.Hash == "" || tip.Height < 0 {
+		return nil
+	}
+	if err := os.RemoveAll(s.utxoDir()); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.utxoDir(), 0700); err != nil {
+		return err
+	}
+	for h := int32(0); h <= tip.Height; h++ {
+		idx, err := s.LoadIndexByHeight(h)
+		if err != nil {
+			return err
+		}
+		block, _, err := s.LoadBlock(idx.Hash)
+		if err != nil {
+			return err
+		}
+		// Mirror connectBlockLocked: an output that is spent again inside the
+		// same block is never written, so keep the per-block pending set and
+		// only flush what survives the whole block. Spends of earlier blocks are
+		// removed from disk immediately.
+		pending := make(map[string]blockchain.UTXOEntry)
+		for txIndex, tx := range block.Transactions {
+			for _, in := range tx.TxIn {
+				key := blockchain.OutPointKey(in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
+				if _, fromSameBlock := pending[key]; fromSameBlock {
+					delete(pending, key)
+					continue
+				}
+				if err := os.Remove(s.utxoPath(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			txHash, err := tx.TxHash()
+			if err != nil {
+				return err
+			}
+			txID := txHash.String()
+			for vout, out := range tx.TxOut {
+				key := blockchain.OutPointKey(txID, uint32(vout))
+				pending[key] = blockchain.UTXOEntry{
+					Key:      key,
+					TxID:     txID,
+					Vout:     uint32(vout),
+					Value:    out.Value,
+					PkScript: hex.EncodeToString(out.PkScript),
+					Height:   idx.Height,
+					Coinbase: txIndex == 0,
+				}
+			}
+		}
+		for _, entry := range pending {
+			if err := s.writeUTXO(entry); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -2519,6 +2519,14 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, outbound bool) {
 			} else {
 				s.log.Printf("p2p processed block from %s status=%s hash=%s height=%d best_changed=%v reason=%s", conn.RemoteAddr(), result.Status, result.Hash, result.CalculatedHeight, result.BestChanged, result.Reason)
 			}
+			// Any block that lands on the active chain makes the transactions it
+			// confirmed unbuildable, so the mempool is reconciled for every
+			// connected block and not only for the ones that change the best
+			// chain. Leaving a confirmed transaction behind poisons every later
+			// block template (bad-txns-inputs-missingorspent).
+			if result.Connected && s.pool != nil {
+				s.pool.RemoveForBlock(block)
+			}
 			if !result.Connected || !result.BestChanged {
 				// The block's parent is unknown: store it as an orphan and
 				// proactively request the missing parent by hash. Without
@@ -2533,9 +2541,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, outbound bool) {
 				continue
 			}
 			s.noteBlockConnected()
-			if s.pool != nil {
-				s.pool.RemoveForBlock(block)
-			}
 			hash, err := chainhash.FromString(result.Hash)
 			if err == nil {
 				s.log.Printf("p2p connected active block %s height=%d from %s", hash.String(), result.NewBestHeight, conn.RemoteAddr())

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -58,7 +59,15 @@ func (b *LBTC) GetBalance(address string) (Balance, error) {
 	if v, ok := m["received"].(float64); ok {
 		bal.Received = v
 	}
+	// This node has no confirmed/unconfirmed split in getaddressbalance; it
+	// reports addressindex_confirmed_only instead, and true there means the
+	// figure covers confirmed outputs only. Trust the node's own flag, and
+	// assume confirmed when the field is absent rather than claiming a
+	// confirmation the reply never made.
 	bal.Confirmed = true
+	if v, ok := m["addressindex_confirmed_only"].(bool); ok {
+		bal.Confirmed = v
+	}
 	return bal, nil
 }
 
@@ -210,20 +219,233 @@ func (b *LBTC) GetNewAddress(label string) (string, error) {
 	return "", ErrNotImplemented
 }
 
+// lbtcBaseUnits is the node's smallest denomination: 1 LBTC = 1e8 base units
+// (the node reports fees in base units, e.g. 0.002 LBTC as fee=200000).
+const lbtcBaseUnits = 100000000
+
+// formatLBTCTx renders base units as the decimal LBTC string the node's RPC
+// expects, without float rounding surprises.
+func formatLBTCTx(v int64) string {
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	s := fmt.Sprintf("%d.%08d", v/lbtcBaseUnits, v%lbtcBaseUnits)
+	if neg {
+		return "-" + s
+	}
+	return s
+}
+
+// SendFromNodeWallet lets the node's own wallet pay `to`, choosing the source
+// UTXOs itself: its sendtoaddress takes no from-address parameter, so the
+// debit lands on the wallet as a whole rather than on the labelled hot address.
+//
+// This is the only way to spend the operational float. Those addresses have no
+// extractable key (dumpprivkey answers "address not found") and the external
+// signer requires a privateKey we cannot obtain for them, so the node wallet
+// is the signer of record for hot withdrawals.
+func (b *LBTC) SendFromNodeWallet(to string, amount, fee int64, all ...bool) (SendResult, error) {
+	var res SendResult
+	if to == "" {
+		return res, fmt.Errorf("to is required")
+	}
+	isAll := len(all) > 0 && all[0]
+	if !isAll && amount <= 0 {
+		return res, fmt.Errorf("amount must be positive")
+	}
+	if info, err := b.ValidateAddress(to); err != nil {
+		return res, err
+	} else if !info.IsValid {
+		return res, fmt.Errorf("invalid destination address")
+	}
+
+	// Refuse early rather than let the node build a tx it will reject.
+	have, err := b.walletBalance()
+	if err != nil {
+		return res, err
+	}
+	sendAmt := amount
+	if isAll {
+		sendAmt = have
+		if fee > 0 {
+			sendAmt = have - fee
+		}
+		if sendAmt <= 0 {
+			return res, fmt.Errorf("fee %d exceeds wallet balance %d", fee, have)
+		}
+	} else {
+		need := amount
+		if fee > 0 {
+			need += fee
+		}
+		if have < need {
+			return res, fmt.Errorf("node wallet holds %s LBTC, need %s LBTC",
+				formatLBTCTx(have), formatLBTCTx(need))
+		}
+		sendAmt = amount
+	}
+	params := []any{to, formatLBTCTx(sendAmt)}
+	if fee > 0 {
+		params = append(params, formatLBTCTx(fee))
+	}
+	raw, err := b.rpc.Call("sendtoaddress", params)
+	if err != nil {
+		return res, fmt.Errorf("sendtoaddress: %v", err)
+	}
+	txid, err := txidFromNodeResult(raw)
+	if err != nil {
+		return res, err
+	}
+	res.Txid = txid
+	res.Fee = fee
+	return res, nil
+}
+
+// SweepNodeWallet consolidates one wallet-owned address into `to` with no
+// change output, delegating to the node's sweepallraw RPC. It is deliberately
+// per-address rather than a wallet-wide sweep: consolidation must move one
+// address' float at a time so the resulting transactions stay attributable, and
+// so a failure cannot strand funds spread across unrelated addresses.
+//
+// sendtoaddress cannot be used for this. It stops selecting inputs once the
+// requested amount is covered and returns the remainder as change, so computing
+// amount=balance-fee still leaves a change output whenever the input selection
+// overshoots - which is the dust this sweep exists to remove. getbalance is
+// also display-rounded, so the derived amount can overshoot the real total and
+// be rejected outright. sweepallraw consumes every spendable input of `from`
+// and emits exactly one output of total-fee, so no change address is involved.
+func (b *LBTC) SweepNodeWallet(from, to string, fee int64) (SendResult, error) {
+	var res SendResult
+	if from == "" || to == "" {
+		return res, fmt.Errorf("from and to are required")
+	}
+	if fee < 0 {
+		return res, fmt.Errorf("fee must not be negative")
+	}
+	if info, err := b.ValidateAddress(from); err == nil && !info.IsMine {
+		return res, fmt.Errorf("source address %s is not owned by the node wallet", from)
+	}
+	if info, err := b.ValidateAddress(to); err != nil {
+		return res, err
+	} else if !info.IsValid {
+		return res, fmt.Errorf("invalid destination address")
+	}
+	raw, err := b.rpc.Call("sweepallraw", []any{from, to, fee})
+	if err != nil {
+		return res, fmt.Errorf("sweepallraw: %v", err)
+	}
+	txid, err := txidFromNodeResult(raw)
+	if err != nil {
+		return res, err
+	}
+	res.Txid = txid
+	res.Fee = fee
+	if m, ok := raw.(map[string]any); ok {
+		if v, ok := m["amount"].(float64); ok {
+			res.Amount = int64(v)
+		}
+		if v, ok := m["amount_base_units"].(float64); ok {
+			res.Amount = int64(v)
+		}
+	}
+	return res, nil
+}
+
+// walletBalance returns the node wallet's total spendable balance in base
+// units. It deliberately queries "*" and not a single address: withdrawals
+// draw on the wallet as a whole, because sendtoaddress cannot be pointed at
+// one address.
+//
+// getbalance answers with a bare JSON number denominated in LBTC, not in base
+// units: a wallet holding 77607.37894037 comes back as 77607.37894037. Reading
+// that as base units would understate the balance a millionfold and reject
+// every real withdrawal, so both the numeric and the string case scale up.
+func (b *LBTC) walletBalance() (int64, error) {
+	res, err := b.rpc.Call("getbalance", []any{"*"})
+	if err != nil {
+		return 0, fmt.Errorf("getbalance: %v", err)
+	}
+	switch v := res.(type) {
+	case float64:
+		return lbtcToBaseUnits(v)
+	case json.Number:
+		f, perr := v.Float64()
+		if perr != nil {
+			return 0, fmt.Errorf("getbalance: cannot parse %q", v.String())
+		}
+		return lbtcToBaseUnits(f)
+	case string:
+		var f float64
+		if _, serr := fmt.Sscanf(v, "%g", &f); serr != nil {
+			return 0, fmt.Errorf("getbalance: cannot parse %q", v)
+		}
+		return lbtcToBaseUnits(f)
+	default:
+		return 0, fmt.Errorf("getbalance: unexpected result %T", res)
+	}
+}
+
+// lbtcToBaseUnits converts an LBTC amount to base units, rounding rather than
+// truncating so a wallet balance never reads short.
+func lbtcToBaseUnits(lbtc float64) (int64, error) {
+	if math.IsNaN(lbtc) || math.IsInf(lbtc, 0) {
+		return 0, fmt.Errorf("getbalance: non-finite value %v", lbtc)
+	}
+	return int64(math.Round(lbtc * lbtcBaseUnits)), nil
+}
+
+// txidFromNodeResult reads the txid out of a node reply. sendtoaddress on this
+// build returns an object even when verbosity is not requested, unlike
+// sendrawtransaction which returns a bare string, so accept both.
+func txidFromNodeResult(res any) (string, error) {
+	switch v := res.(type) {
+	case string:
+		if v == "" {
+			return "", fmt.Errorf("node returned empty txid")
+		}
+		return strings.Trim(v, `"`), nil
+	case map[string]any:
+		for _, k := range []string{"txid", "tx_id", "hash"} {
+			if s, ok := v[k].(string); ok && s != "" {
+				return s, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("cannot extract txid from node reply %T", res)
+}
+
 // SignAndSend builds, signs (via the local 8053 signer) and broadcasts an LBTC
 // transaction. fee<=0 picks the minimum relay fee, which here is 1000 sompi/KB
 // (~1 sompi per tx byte). Signer contract: POST /v2/tx with
 // {symbol, privateKey, inputs:[{txId,vOut}], outputs:[{address,amount}], fee}
 // returns {status:"ok", rawTx:'{"rawTx":"<hex>"}'}.
-func (b *LBTC) SignAndSend(from, to string, amount, fee int64, privateKey string) (SendResult, error) {
+//
+// When privateKey is empty but `from` belongs to the node's own wallet, the
+// node wallet signs instead. That is the hot-withdrawal case: the operational
+// address has no extractable key, so no privateKey can be supplied for it.
+func (b *LBTC) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
 	var res SendResult
 	if from == "" || to == "" {
 		return res, fmt.Errorf("from and to are required")
 	}
-	if amount <= 0 {
-		return res, fmt.Errorf("amount must be positive")
+	isAll := len(all) > 0 && all[0]
+	if isAll {
+		if amount < 0 {
+			amount = 0
+		}
+	} else {
+		if amount <= 0 {
+			return res, fmt.Errorf("amount must be positive")
+		}
 	}
 	if privateKey == "" {
+		if info, verr := b.ValidateAddress(from); verr == nil && info.IsMine {
+			if isAll {
+				return b.SweepNodeWallet(from, to, fee)
+			}
+			return b.SendFromNodeWallet(to, amount, fee)
+		}
 		return res, fmt.Errorf("privateKey is required")
 	}
 	if info, err := b.ValidateAddress(to); err != nil {
@@ -257,6 +479,29 @@ func (b *LBTC) SignAndSend(from, to string, amount, fee int64, privateKey string
 		return out, total
 	}
 
+	// pickAll returns every spendable UTXO, largest first. A sweep must consume
+	// all of them: stopping early is what makes the leftover reappear as a
+	// change output, which is exactly the dust a sweep is meant to remove.
+	pickAll := func() ([]UTXO, int64) {
+		sorted := make([]UTXO, len(utxos))
+		copy(sorted, utxos)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Value > sorted[j].Value })
+		return sorted, sumUTXOs(sorted)
+	}
+
+	// sweepOutputs builds the change-free output set: a single destination
+	// output carrying total-fee, with no change output back to the source.
+	sweepOutputs := func(total, usedFee int64) ([]signOut, error) {
+		sendAmt := total - usedFee
+		if sendAmt <= 0 {
+			return nil, fmt.Errorf("fee %d consumes the whole balance %d", usedFee, total)
+		}
+		if sendAmt < minRelayFee(226) {
+			return nil, fmt.Errorf("swept amount %d is below dust", sendAmt)
+		}
+		return []signOut{{Address: to, Amount: sendAmt}}, nil
+	}
+
 	// Estimate fee iteratively: fee depends on tx size which depends on the
 	// number of inputs picked, which depends on fee.
 	const maxIters = 8
@@ -269,17 +514,27 @@ func (b *LBTC) SignAndSend(from, to string, amount, fee int64, privateKey string
 	// We need at least one pass to learn the assembled tx size. Do the
 	// selection with a generous initial guess so the pick count is stable.
 	for iter := 0; iter < maxIters; iter++ {
-		needed := amount + usedFee
-		ins, tot := pickInputs(needed)
-		if tot < needed {
-			return res, fmt.Errorf("insufficient funds: have %d, need %d", tot, needed)
-		}
-		inputs, total = ins, tot
+		var outputs []signOut
+		if isAll {
+			inputs, total = pickAll()
+			outs, err := sweepOutputs(total, usedFee)
+			if err != nil {
+				return res, err
+			}
+			outputs = outs
+		} else {
+			needed := amount + usedFee
+			ins, tot := pickInputs(needed)
+			if tot < needed {
+				return res, fmt.Errorf("insufficient funds: have %d, need %d", tot, needed)
+			}
+			inputs, total = ins, tot
 
-		change := total - amount - usedFee
-		outputs := []signOut{{Address: to, Amount: amount}}
-		if change > 0 {
-			outputs = append(outputs, signOut{Address: from, Amount: change})
+			change := total - amount - usedFee
+			outputs = []signOut{{Address: to, Amount: amount}}
+			if change > 0 {
+				outputs = append(outputs, signOut{Address: from, Amount: change})
+			}
 		}
 
 		hex, err := b.callSigner(privateKey, inputsToSigner(inputs), outputs, usedFee)
@@ -296,13 +551,22 @@ func (b *LBTC) SignAndSend(from, to string, amount, fee int64, privateKey string
 	// Verify the last selection also covers amount+fee (fee may have risen in
 	// the final pass, changing the change value but not the picks).
 	// Rebuild once more with the final fee so the signed change is exact.
-	change := total - amount - usedFee
-	if change < 0 {
-		return res, fmt.Errorf("insufficient funds after fee of %d", usedFee)
-	}
-	outputs := []signOut{{Address: to, Amount: amount}}
-	if change > 0 {
-		outputs = append(outputs, signOut{Address: from, Amount: change})
+	var outputs []signOut
+	if isAll {
+		outs, err := sweepOutputs(total, usedFee)
+		if err != nil {
+			return res, err
+		}
+		outputs = outs
+	} else {
+		change := total - amount - usedFee
+		if change < 0 {
+			return res, fmt.Errorf("insufficient funds after fee of %d", usedFee)
+		}
+		outputs = []signOut{{Address: to, Amount: amount}}
+		if change > 0 {
+			outputs = append(outputs, signOut{Address: from, Amount: change})
+		}
 	}
 	hex, err := b.callSigner(privateKey, inputsToSigner(inputs), outputs, usedFee)
 	if err != nil {
@@ -344,6 +608,14 @@ func inputsToSigner(utxos []UTXO) []signIn {
 // The node checks fee >= (size*1000+999)/1000, i.e. ~1 sompi/byte.
 func minRelayFee(size int64) int64 {
 	return (size*1000 + 999) / 1000
+}
+
+func sumUTXOs(utxos []UTXO) int64 {
+	var t int64
+	for _, u := range utxos {
+		t += u.Value
+	}
+	return t
 }
 
 // Estimate is a dry-run fee calculation for a send without signing or
@@ -417,11 +689,11 @@ func (b *LBTC) Estimate(from, to string, amount int64) (FeeEstimate, error) {
 
 func (b *LBTC) callSigner(privateKey string, inputs []signIn, outputs []signOut, fee int64) (string, error) {
 	body, _ := json.Marshal(map[string]any{
-		"symbol":      "LBTC",
-		"privateKey":  privateKey,
-		"inputs":      inputs,
-		"outputs":     outputs,
-		"fee":         fee,
+		"symbol":     "LBTC",
+		"privateKey": privateKey,
+		"inputs":     inputs,
+		"outputs":    outputs,
+		"fee":        fee,
 	})
 	req, err := http.NewRequest("POST", b.signerURL+"/v2/tx", bytes.NewReader(body))
 	if err != nil {

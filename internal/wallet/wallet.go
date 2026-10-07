@@ -789,14 +789,71 @@ func (w *Wallet) safeMempoolChangeLocked(txs []*wire.MsgTx, locked map[string]st
 }
 
 func (w *Wallet) SendToAddress(chain *blockchain.Chain, pool *mempool.Pool, to string, amount int64, fee int64) (string, error) {
-	return w.sendWithSource(chain, pool, "", to, amount, fee, nil)
+	txid, _, err := w.sendWithSource(chain, pool, "", to, amount, fee, nil, false)
+	return txid, err
 }
 
 func (w *Wallet) SendFromAddress(chain *blockchain.Chain, pool *mempool.Pool, from string, to string, amount int64, fee int64) (string, error) {
 	if from == "" {
 		return "", fmt.Errorf("bad source address")
 	}
-	return w.sendWithSource(chain, pool, from, to, amount, fee, nil)
+	txid, _, err := w.sendWithSource(chain, pool, from, to, amount, fee, nil, false)
+	return txid, err
+}
+
+// SendToAddressFromAddrs sends an exact `amount` to `to`, drawing inputs only
+// from the listed wallet addresses. Selection stops as soon as the named inputs
+// cover amount+fee and any remainder comes back as a change output. Unlike Sweep
+// it never merges unrelated addresses on its own, which makes it the safe way
+// to assemble a precise transfer out of several one-UTXO addresses.
+func (w *Wallet) SendToAddressFromAddrs(chain *blockchain.Chain, pool *mempool.Pool, froms []string, to string, amount int64, fee int64) (string, error) {
+	if len(froms) == 0 {
+		return "", fmt.Errorf("bad source address")
+	}
+	if to == "" {
+		return "", fmt.Errorf("bad destination address")
+	}
+	txid, _, err := w.sendWithSources(chain, pool, froms, to, amount, fee, nil, false)
+	return txid, err
+}
+
+// Sweep sends every spendable wallet input to `to` in a single output with no
+// change address. Restricting the sweep to one source address is what keeps a
+// consolidation sweep from merging unrelated operational floats, so `from` is
+// required and must be wallet-owned. It returns the swept amount as well, which
+// callers need because the amount is a derived value (total-fee) rather than
+// something the caller supplied.
+func (w *Wallet) Sweep(chain *blockchain.Chain, pool *mempool.Pool, from string, to string, fee int64) (string, int64, error) {
+	if from == "" {
+		return "", 0, fmt.Errorf("bad source address")
+	}
+	if to == "" {
+		return "", 0, fmt.Errorf("bad destination address")
+	}
+	if fee < 0 {
+		return "", 0, fmt.Errorf("bad fee")
+	}
+	unspent, err := w.ListUnspentForSpend(chain, pool)
+	if err != nil {
+		return "", 0, err
+	}
+	total := int64(0)
+	for _, u := range unspent {
+		if u.Locked || u.Address != from {
+			continue
+		}
+		if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
+			continue
+		}
+		total += u.Value
+	}
+	txid, effFee, err := w.sendWithSource(chain, pool, from, to, 0, fee, nil, true)
+	if err != nil {
+		return "", 0, err
+	}
+	// effFee is the fee the transaction actually pays, which differs from the
+	// requested fee when the caller left it at zero and auto-fee took over.
+	return txid, total - effFee, nil
 }
 
 func (w *Wallet) SendMany(chain *blockchain.Chain, pool *mempool.Pool, from string, outputs map[string]int64, fee int64) (string, int64, error) {
@@ -825,7 +882,7 @@ func (w *Wallet) SendMany(chain *blockchain.Chain, pool *mempool.Pool, from stri
 		totalAmount += amountValue
 		extra = append(extra, wire.TxOut{Value: amountValue, PkScript: pkScript})
 	}
-	txid, err := w.sendWithSource(chain, pool, from, "", 0, fee, extra)
+	txid, _, err := w.sendWithSource(chain, pool, from, "", 0, fee, extra, false)
 	if err != nil {
 		return "", 0, err
 	}
@@ -1003,7 +1060,8 @@ func (w *Wallet) SendTokenMarkers(chain *blockchain.Chain, pool *mempool.Pool, f
 		}
 		extra = append(extra, wire.TxOut{Value: mempool.DustThreshold, PkScript: pk})
 	}
-	return w.sendWithSource(chain, pool, from, "", 0, fee, extra)
+	txid, _, err := w.sendWithSource(chain, pool, from, "", 0, fee, extra, false)
+	return txid, err
 }
 
 func (w *Wallet) SplitCoins(chain *blockchain.Chain, pool *mempool.Pool, from string, total int64, outputs int, fee int64) (string, error) {
@@ -1046,18 +1104,47 @@ func (w *Wallet) SplitCoins(chain *blockchain.Chain, pool *mempool.Pool, from st
 		}
 		extra = append(extra, wire.TxOut{Value: value, PkScript: splitScript})
 	}
-	return w.sendWithSource(chain, pool, from, "", 0, fee, extra)
+	txid, _, err := w.sendWithSource(chain, pool, from, "", 0, fee, extra, false)
+	return txid, err
 }
 
-func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, from string, to string, amount int64, fee int64, extraOutputs []wire.TxOut) (string, error) {
+// sendWithSource builds, signs and submits a transaction from wallet inputs.
+//
+// sweep=true changes coin selection only: instead of stopping as soon as the
+// running total covers the target, it consumes every spendable wallet input for
+// the source and then sets the single destination output to total-fee. Because
+// target then equals total exactly, no change output is ever created. That is
+// what makes a consolidation sweep dust-free; a normal send leaves a change
+// output whose value is whatever the input selection did not cover, which is
+// precisely how dust accumulates across many small consolidations.
+func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, from string, to string, amount int64, fee int64, extraOutputs []wire.TxOut, sweep bool) (string, int64, error) {
+	var froms []string
+	if from != "" {
+		froms = []string{from}
+	}
+	return w.sendWithSources(chain, pool, froms, to, amount, fee, extraOutputs, sweep)
+}
+
+// sendWithSources is the multi-address form of sendWithSource. `froms` is an
+// explicit allowlist of wallet addresses to draw inputs from; an empty list
+// means any wallet address. Restricting selection to a named set is what lets a
+// caller assemble an exact amount out of many one-UTXO addresses without ever
+// touching operational floats that are not on the list.
+func (w *Wallet) sendWithSources(chain *blockchain.Chain, pool *mempool.Pool, froms []string, to string, amount int64, fee int64, extraOutputs []wire.TxOut, sweep bool) (string, int64, error) {
+	allow := make(map[string]bool, len(froms))
+	for _, a := range froms {
+		if a != "" {
+			allow[a] = true
+		}
+	}
 	if err := w.requireUnlocked(); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if pool == nil {
-		return "", fmt.Errorf("mempool not initialized")
+		return "", 0, fmt.Errorf("mempool not initialized")
 	}
-	if amount < 0 || fee < 0 || (amount == 0 && len(extraOutputs) == 0) {
-		return "", fmt.Errorf("bad amount or fee")
+	if amount < 0 || fee < 0 || (amount == 0 && len(extraOutputs) == 0 && !sweep) {
+		return "", 0, fmt.Errorf("bad amount or fee")
 	}
 	autoFee := fee <= 0
 	if autoFee {
@@ -1068,22 +1155,30 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 	if amount > 0 {
 		toScript, err = destinationScript(to)
 		if err != nil {
-			return "", err
+			return "", 0, err
+		}
+	}
+	if sweep {
+		// A sweep always produces exactly one destination output, so the script
+		// is resolved once the swept total is known.
+		toScript, err = destinationScript(to)
+		if err != nil {
+			return "", 0, err
 		}
 	}
 	target := amount + fee
 	for _, out := range extraOutputs {
 		if out.Value < mempool.DustThreshold {
-			return "", fmt.Errorf("dust marker output")
+			return "", 0, fmt.Errorf("dust marker output")
 		}
 		target += out.Value
 	}
 	if !chaincfg.MoneyRange(target) {
-		return "", fmt.Errorf("bad target amount")
+		return "", 0, fmt.Errorf("bad target amount")
 	}
 	unspent, err := w.ListUnspentForSpend(chain, pool)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	type chosen struct {
 		utxo       UTXOView
@@ -1101,7 +1196,7 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 			// Conservative wallet policy: avoid selecting immature coinbase outputs.
 			continue
 		}
-		if from != "" && u.Address != from {
+		if len(allow) > 0 && !allow[u.Address] {
 			continue
 		}
 		if hexKey, ok := w.keys[u.Address]; ok {
@@ -1112,7 +1207,7 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 			priv, _ := btcec.PrivKeyFromBytes(keyBytes)
 			selected = append(selected, chosen{utxo: u, classicKey: priv})
 			total += u.Value
-			if total >= target {
+			if !sweep && total >= target {
 				break
 			}
 			continue
@@ -1124,21 +1219,38 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 			}
 			selected = append(selected, chosen{utxo: u, hybridKey: hk})
 			total += u.Value
-			if total >= target {
+			if !sweep && total >= target {
 				break
 			}
 		}
 	}
 	w.mu.RUnlock()
+	if len(selected) == 0 {
+		return "", 0, fmt.Errorf("no spendable wallet inputs: pending transactions already lock selected wallet inputs")
+	}
+	if sweep {
+		// Every spendable input is consumed, so the fee is the only thing left
+		// to subtract and the single output carries the rest.
+		if total <= fee {
+			return "", 0, fmt.Errorf("sweep total %d does not exceed fee %d", total, fee)
+		}
+		amount = total - fee
+		if !chaincfg.MoneyRange(amount) {
+			return "", 0, fmt.Errorf("bad swept amount")
+		}
+		target = total
+	}
 	if total < target {
-		return "", fmt.Errorf("insufficient available funds: pending transactions already lock selected wallet inputs")
+		return "", 0, fmt.Errorf("insufficient available funds: pending transactions already lock selected wallet inputs")
 	}
 	if autoFee {
 		numOuts := len(extraOutputs)
-		if amount > 0 {
+		if amount > 0 || sweep {
+			// A sweep always emits its single destination output, even when the
+			// caller's amount is zero and the value is only known after fees.
 			numOuts++
 		}
-		if total > target {
+		if !sweep && total > target {
 			numOuts++ // change output
 		}
 		estSize := 10 + len(selected)*148 + numOuts*34
@@ -1146,20 +1258,31 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 		if fee < mempool.MinRelayFeePerKB {
 			fee = mempool.MinRelayFeePerKB
 		}
-		newTarget := amount + fee
-		for _, out := range extraOutputs {
-			newTarget += out.Value
+		if sweep {
+			// Everything is consumed, so the fee comes straight off the total.
+			// This has to happen before any total < target check, otherwise the
+			// freshly estimated fee would always look like a funding shortfall.
+			if total <= fee {
+				return "", 0, fmt.Errorf("sweep total %d does not exceed fee %d", total, fee)
+			}
+			amount = total - fee
+			target = total
+		} else {
+			newTarget := amount + fee
+			for _, out := range extraOutputs {
+				newTarget += out.Value
+			}
+			if total < newTarget {
+				return "", 0, fmt.Errorf("insufficient funds for estimated fee")
+			}
+			target = newTarget
 		}
-		if total < newTarget {
-			return "", fmt.Errorf("insufficient funds for estimated fee")
-		}
-		target = newTarget
 	}
 	tx := &wire.MsgTx{Version: 1}
 	for _, c := range selected {
 		prevHash, err := blockchainHash(c.utxo.TxID)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		tx.TxIn = append(tx.TxIn, wire.TxIn{
 			PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: c.utxo.Vout},
@@ -1171,25 +1294,25 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 	}
 	tx.TxOut = append(tx.TxOut, extraOutputs...)
 	change := total - target
-	if change > 0 {
+	if change > 0 && !sweep {
 		changeAddr, err := w.NewAddress()
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		var changeScript []byte
 		if hybridHash, err := address.DecodeHybridAddress(changeAddr); err == nil {
 			changeScript, err = script.PayToHybridPubKeyHashScript(hybridHash)
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 		} else {
 			_, payload, err := address.DecodeBase58Check(changeAddr)
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 			changeScript, err = script.PayToPubKeyHashScript(payload)
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 		}
 		tx.TxOut = append(tx.TxOut, wire.TxOut{Value: change, PkScript: changeScript})
@@ -1199,51 +1322,51 @@ func (w *Wallet) sendWithSource(chain *blockchain.Chain, pool *mempool.Pool, fro
 		if pkScriptHex == "" {
 			entry, err := chain.UTXO(c.utxo.TxID, c.utxo.Vout)
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 			pkScriptHex = entry.PkScript
 		}
 		prevScript, err := hex.DecodeString(pkScriptHex)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		sighash, err := script.SignatureHash(tx, i, prevScript, script.SigHashAll)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		var sigScript []byte
 		switch {
 		case script.IsPayToPubKeyHash(prevScript):
 			if c.classicKey == nil {
-				return "", fmt.Errorf("missing classic key for %s", c.utxo.Address)
+				return "", 0, fmt.Errorf("missing classic key for %s", c.utxo.Address)
 			}
 			sig := btcecdsa.Sign(c.classicKey, sighash[:]).Serialize()
 			sigScript, err = script.SignatureScript(sig, c.classicKey.PubKey().SerializeCompressed())
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 		case script.IsPayToHybridPubKeyHash(prevScript):
 			if c.hybridKey == nil {
-				return "", fmt.Errorf("missing hybrid key for %s", c.utxo.Address)
+				return "", 0, fmt.Errorf("missing hybrid key for %s", c.utxo.Address)
 			}
 			hsig, err := c.hybridKey.Sign(sighash[:])
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 			sigScript, err = script.HybridSignatureScript(hsig, c.hybridKey.Public().Bytes())
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 		default:
-			return "", fmt.Errorf("unsupported spend script for wallet input")
+			return "", 0, fmt.Errorf("unsupported spend script for wallet input")
 		}
 		tx.TxIn[i].SignatureScript = sigScript
 	}
 	entry, err := pool.Add(chain, tx)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return entry.TxID, nil
+	return entry.TxID, fee, nil
 }
 
 func destinationScript(to string) ([]byte, error) {

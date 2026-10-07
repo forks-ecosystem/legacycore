@@ -381,7 +381,7 @@ func massageKaspaErr(msg string) string {
 	return strings.TrimSpace(msg)
 }
 
-func (k *KaspaRest) SignAndSend(from, to string, amount, fee int64, privateKey string) (SendResult, error) {
+func (k *KaspaRest) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
 	var res SendResult
 	if from == "" || to == "" {
 		return res, errors.New("from and to are required")

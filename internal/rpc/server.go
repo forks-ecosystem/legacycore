@@ -297,6 +297,9 @@ var rpcHelpEntries = []rpcHelpEntry{
 	{Method: "listtransactions", Usage: "listtransactions [count] [skip]", Category: "wallet", Description: "Return recent wallet history."},
 	{Method: "listsinceblock", Usage: "listsinceblock [blockhash]", Category: "wallet", Description: "Return wallet history since block."},
 	{Method: "sendtoaddress", Usage: "sendtoaddress <address> <amount_lbtc> [fee_lbtc]", Category: "wallet", Description: "Send LBTC to one address."},
+	{Method: "sendfromaddress", Usage: "sendfromaddress <from> <to> <amount_lbtc> [fee_lbtc]", Category: "wallet", Description: "Send LBTC from one wallet address; use sendfromaddressraw for base units"},
+	{Method: "sweepall", Usage: "sweepall <from> <to> [fee_lbtc]", Category: "wallet", Description: "Send every spendable input of <from> to <to> in one output with no change; use sweepallraw for base units."},
+	{Method: "sweepallraw", Usage: "sweepallraw <from> <to> [fee_base_units]", Category: "wallet", Description: "sweepall using explicit base units for the fee."},
 	{Method: "sendmany", Usage: "sendmany \"\" {\"addr\":amount,...}", Category: "wallet", Description: "Send LBTC to multiple addresses in one tx."},
 	{Method: "sendmanyraw", Usage: "sendmanyraw \"\" {\"addr\":base_units,...}", Category: "wallet", Description: "sendmany using explicit base units."},
 	{Method: "signrawtransactionwithwallet", Usage: "signrawtransactionwithwallet <rawtx_hex>", Category: "wallet", Description: "Sign wallet-known inputs in raw transaction."},
@@ -1552,6 +1555,13 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 				return "rejected", nil
 			}
 		}
+		// Reconcile the mempool with the chain the same way the p2p path does.
+		// Without this a transaction that the just-connected block confirmed
+		// stays in the mempool with spent inputs, which makes every following
+		// block template unminable (bad-txns-inputs-missingorspent).
+		if s.pool != nil {
+			s.pool.RemoveForBlock(block)
+		}
 		if hash, err := s.chain.BlockHash(block); err == nil && s.p2p != nil {
 			// Announce the block by canonical Yespower block hash, not SHA256d.
 			s.p2p.AnnounceBlock(hash)
@@ -2301,6 +2311,39 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 		}
 		s.announceMempoolTx(txid)
 		return txSendResult(txid, amountValue, feeValue, rawMode), nil
+	case "sendfromaddrs":
+		// Exact-amount transfer assembled from an explicit list of wallet
+		// addresses. Used to fund deposit addresses with precise sums without
+		// sweeping unrelated operational floats.
+		var args []json.RawMessage
+		if err := json.Unmarshal(params, &args); err != nil || len(args) < 3 {
+			return nil, &rpcError{Code: -32602, Message: "sendfromaddrs expects from_addresses, to, amount_lbtc, optional fee_lbtc"}
+		}
+		var froms []string
+		if err := json.Unmarshal(args[0], &froms); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "bad source address list"}
+		}
+		var to string
+		if err := json.Unmarshal(args[1], &to); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "bad destination address"}
+		}
+		amountValue, err := parseRPCAmount(args[2], true)
+		if err != nil {
+			return nil, &rpcError{Code: -32602, Message: "bad amount: " + err.Error()}
+		}
+		feeValue := s.currentTxFee()
+		if len(args) > 3 {
+			feeValue, err = parseRPCAmount(args[3], true)
+			if err != nil {
+				return nil, &rpcError{Code: -32602, Message: "bad fee: " + err.Error()}
+			}
+		}
+		txid, err := w.SendToAddressFromAddrs(s.chain, s.pool, froms, to, amountValue, feeValue)
+		if err != nil {
+			return nil, &rpcError{Code: -6, Message: rpcSendError(err)}
+		}
+		s.announceMempoolTx(txid)
+		return txSendResult(txid, amountValue, feeValue, true), nil
 	case "sendfromaddress", "sendfromaddressraw":
 		var args []json.RawMessage
 		if err := json.Unmarshal(params, &args); err != nil || len(args) < 3 {
@@ -2332,6 +2375,42 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 		}
 		s.announceMempoolTx(txid)
 		return txSendResult(txid, amountValue, feeValue, rawMode), nil
+	case "sweepall", "sweepallraw":
+		// sweepall spends every spendable input of one wallet address into a
+		// single output at the destination, with no change output. A plain send
+		// cannot express this: the wallet stops selecting inputs once the target
+		// is covered, so the leftover always becomes a change output and repeated
+		// consolidations leave dust behind.
+		var args []json.RawMessage
+		if err := json.Unmarshal(params, &args); err != nil || len(args) < 2 {
+			return nil, &rpcError{Code: -32602, Message: method + " expects from, to, optional fee"}
+		}
+		var from string
+		var to string
+		if err := json.Unmarshal(args[0], &from); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "bad source address"}
+		}
+		if err := json.Unmarshal(args[1], &to); err != nil {
+			return nil, &rpcError{Code: -32602, Message: "bad destination address"}
+		}
+		rawMode := method == "sweepallraw"
+		feeValue := s.currentTxFee()
+		if len(args) > 2 {
+			var err error
+			feeValue, err = parseRPCAmount(args[2], rawMode)
+			if err != nil {
+				return nil, &rpcError{Code: -32602, Message: "bad fee: " + err.Error()}
+			}
+		}
+		txid, swept, err := w.Sweep(s.chain, s.pool, from, to, feeValue)
+		if err != nil {
+			return nil, &rpcError{Code: -6, Message: rpcSendError(err)}
+		}
+		s.announceMempoolTx(txid)
+		result := txSendResult(txid, swept, feeValue, rawMode)
+		result["swept"] = true
+		result["no_change"] = true
+		return result, nil
 	case "sendmany", "sendmanyraw":
 		var args []json.RawMessage
 		if err := json.Unmarshal(params, &args); err != nil || len(args) < 2 {
@@ -3058,6 +3137,14 @@ func (s *Server) call(ctx context.Context, method string, params json.RawMessage
 		}
 		entry, err := s.chain.UTXO(txid, vout)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// Отсутствующий UTXO-файл означает, что выход потрачен или
+				// неизвестен, а не что «блок не найден»: blockLookupError
+				// отдавал здесь -5 "block not found", и все вызывающие
+				// (бэкфилл депозитов, live-монитор) читали это как сбой RPC.
+				// Bitcoin Core в такой ситуации отвечает null.
+				return nil, nil
+			}
 			return nil, blockLookupError(err)
 		}
 		return entry, nil
@@ -3378,6 +3465,9 @@ func (s *Server) submitBlockDiagnostic(params json.RawMessage, process bool) (an
 			s.p2p.AnnounceBlock(hash)
 		}
 	}
+	if accepted && s.pool != nil {
+		s.pool.RemoveForBlock(block)
+	}
 	if tip := s.chain.Tip(); tip != nil {
 		diagnostic["daemon_after_height"] = tip.Height
 		diagnostic["daemon_after_best_hash"] = tip.Hash
@@ -3492,17 +3582,10 @@ func (s *Server) lookupTransaction(txid string) (*txLookupResult, error) {
 	if txid == "" {
 		return nil, fmt.Errorf("missing txid")
 	}
-	if s.pool != nil {
-		if tx, ok := s.pool.Lookup(txid); ok {
-			return &txLookupResult{
-				Tx:            tx,
-				TxID:          txid,
-				BlockHeight:   -1,
-				Confirmations: 0,
-				InMempool:     true,
-			}, nil
-		}
-	}
+	// The confirmed record wins over the mempool. A transaction left behind in
+	// the mempool after its block was connected must still be reported as
+	// confirmed, otherwise every consumer (explorer, deposit monitor, wallet)
+	// sees a settled transaction as pending forever.
 	if s.chain.TxIndexEnabled() {
 		tx, idx, _, err := s.chain.LookupTransactionByIndex(txid)
 		if err == nil && tx != nil && idx != nil {
@@ -3515,6 +3598,17 @@ func (s *Server) lookupTransaction(txid string) (*txLookupResult, error) {
 				BlockTime:     idx.Time,
 				Confirmations: confirmations(tip, idx),
 				InMempool:     false,
+			}, nil
+		}
+	}
+	if s.pool != nil {
+		if tx, ok := s.pool.Lookup(txid); ok {
+			return &txLookupResult{
+				Tx:            tx,
+				TxID:          txid,
+				BlockHeight:   -1,
+				Confirmations: 0,
+				InMempool:     true,
 			}, nil
 		}
 	}

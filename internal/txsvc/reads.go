@@ -30,7 +30,7 @@ func (readOnlyBase) GetTransaction(txid string) (*Tx, error) { return nil, ErrNo
 func (readOnlyBase) GetConfirmations(txid string) (int, error) {
 	return 0, ErrNotImplemented
 }
-func (readOnlyBase) SignAndSend(from, to string, amount, fee int64, privateKey string) (SendResult, error) {
+func (readOnlyBase) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
 	return SendResult{}, readonlySignErr()
 }
 

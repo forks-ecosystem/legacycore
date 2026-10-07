@@ -2,7 +2,10 @@ package storage
 
 import (
 	"encoding/hex"
+	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"legacycoin/legacy-go/internal/address"
@@ -405,4 +408,174 @@ func contains(items []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func TestRepairIndexesRebuildsUTXOSet(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	store.SetIndexOptions(true, true)
+
+	pkFor := func(seed byte) ([]byte, string) {
+		pkScript, err := script.PayToPubKeyHashScript(bytesRepeat(seed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pkScript, address.EncodeBase58Check(chaincfg.PublicKeyHashVersion, bytesRepeat(seed))
+	}
+	coinbaseTx := func(pkScript []byte, value int64, seed byte) *wire.MsgTx {
+		return &wire.MsgTx{
+			Version: 1,
+			TxIn: []wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Hash: chainhash.Hash{}, Index: ^uint32(0)},
+				SignatureScript:  []byte{seed},
+				Sequence:         ^uint32(0),
+			}},
+			TxOut: []wire.TxOut{{Value: value, PkScript: pkScript}},
+		}
+	}
+	txIDOf := func(tx *wire.MsgTx) chainhash.Hash {
+		h, err := tx.TxHash()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	entryFor := func(tx *wire.MsgTx, vout int, value int64, pkScript []byte, height int32, coinbase bool) blockchain.UTXOEntry {
+		h := txIDOf(tx)
+		return blockchain.UTXOEntry{
+			Key:      blockchain.OutPointKey(h.String(), uint32(vout)),
+			TxID:     h.String(),
+			Vout:     uint32(vout),
+			Value:    value,
+			PkScript: hex.EncodeToString(pkScript),
+			Height:   height,
+			Coinbase: coinbase,
+		}
+	}
+
+	pkA, addrA := pkFor(0x11)
+	pkB, _ := pkFor(0x22)
+	pkC, addrC := pkFor(0x33)
+	pkCB, _ := pkFor(0x44)
+
+	// Block 0: one coinbase output A.
+	cb0 := coinbaseTx(pkA, 5000, 0x51)
+	blk0 := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Timestamp: 3, Bits: 0x1e7fffff, Nonce: 11},
+		Transactions: []*wire.MsgTx{cb0},
+	}
+	hash0, err := blk0.Header.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryA := entryFor(cb0, 0, 5000, pkA, 0, true)
+	if err := store.SaveBlock(blk0,
+		blockchain.BlockIndex{Height: 0, Hash: hash0.String(), Time: 3, Bits: 0x1e7fffff, Nonce: 11, ChainWork: "1"},
+		[]blockchain.UTXOEntry{entryA}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Block 1: a coinbase plus two spends. tx2 spends an output that tx1 created
+	// in the same block, so that output must never reach the UTXO set.
+	cb1 := coinbaseTx(pkCB, 1234, 0x52)
+	tx1 := &wire.MsgTx{
+		Version: 1,
+		TxIn: []wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: txIDOf(cb0), Index: 0},
+			SignatureScript:  []byte{0x53},
+			Sequence:         ^uint32(0),
+		}},
+		TxOut: []wire.TxOut{{Value: 3000, PkScript: pkB}, {Value: 2000, PkScript: pkC}},
+	}
+	tx2 := &wire.MsgTx{
+		Version: 1,
+		TxIn: []wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: txIDOf(tx1), Index: 0},
+			SignatureScript:  []byte{0x54},
+			Sequence:         ^uint32(0),
+		}},
+		TxOut: []wire.TxOut{{Value: 2990, PkScript: pkC}},
+	}
+	blk1 := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Timestamp: 4, Bits: 0x1e7fffff, Nonce: 12, PrevBlock: hash0},
+		Transactions: []*wire.MsgTx{cb1, tx1, tx2},
+	}
+	hash1, err := blk1.Header.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A is spent by tx1; the vout 0 of tx1 is spent by tx2 within the same block.
+	entryB := entryFor(tx1, 0, 3000, pkB, 1, false)
+	survivors := []blockchain.UTXOEntry{
+		entryFor(cb1, 0, 1234, pkCB, 1, true),
+		entryFor(tx1, 1, 2000, pkC, 1, false),
+		entryFor(tx2, 0, 2990, pkC, 1, false),
+	}
+	if err := store.SaveBlock(blk1,
+		blockchain.BlockIndex{Height: 1, Hash: hash1.String(), Parent: hash0.String(), Time: 4, Bits: 0x1e7fffff, Nonce: 12, ChainWork: "2"},
+		survivors, []string{entryA.Key}, []blockchain.UTXOEntry{entryA}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Leave behind exactly what a real incident looks like: a UTXO directory
+	// holding a truncated, wrong entry for an output that is in fact unspent.
+	keep := filepath.Join(dir, "utxo", strings.ReplaceAll(survivors[1].Key, ":", "_")+".json")
+	if err := os.MkdirAll(filepath.Dir(keep), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RepairIndexes(); err != nil {
+		t.Fatalf("RepairIndexes failed: %v", err)
+	}
+
+	for _, gone := range []blockchain.UTXOEntry{entryA, entryB} {
+		if _, err := store.LoadUTXO(gone.Key); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("spent output %s should be absent from the rebuilt UTXO set, got err=%v", gone.Key, err)
+		}
+	}
+	for _, want := range survivors {
+		got, err := store.LoadUTXO(want.Key)
+		if err != nil {
+			t.Fatalf("rebuilt UTXO %s missing: %v", want.Key, err)
+		}
+		if got.Value != want.Value || got.Height != want.Height || got.Coinbase != want.Coinbase {
+			t.Fatalf("rebuilt UTXO %s = %+v, want value=%d height=%d coinbase=%v",
+				want.Key, *got, want.Value, want.Height, want.Coinbase)
+		}
+	}
+	all, err := store.ListUTXO()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(survivors) {
+		t.Fatalf("rebuilt UTXO set has %d entries, want %d", len(all), len(survivors))
+	}
+	stats, err := store.UTXOStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantTotal int64
+	for _, a := range survivors {
+		wantTotal += a.Value
+	}
+	if stats.Total != wantTotal {
+		t.Fatalf("rebuilt UTXO total = %d, want %d", stats.Total, wantTotal)
+	}
+	utxosA, err := store.AddressUTXOs(addrA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(utxosA) != 0 {
+		t.Fatalf("addrA should have no unspent outputs, got %#v", utxosA)
+	}
+	utxosC, err := store.AddressUTXOs(addrC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(utxosC) != 2 {
+		t.Fatalf("addrC should have 2 unspent outputs, got %#v", utxosC)
+	}
 }

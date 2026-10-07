@@ -290,7 +290,7 @@ type btcSignOut struct {
 	Amount  int64  `json:"amount"`
 }
 
-func (b *Bitcoin) SignAndSend(from, to string, amount, fee int64, privateKey string) (SendResult, error) {
+func (b *Bitcoin) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
 	var res SendResult
 	if from == "" || to == "" {
 		return res, errors.New("from and to are required")

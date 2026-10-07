@@ -574,7 +574,18 @@ func (p *Pool) promoteOrphans(chain *blockchain.Chain, parentTxID string) {
 	}
 }
 
+// RemoveForBlock drops every mempool transaction the connected block made
+// unbuildable: the transactions the block contains, the transactions that
+// conflict with them by spending the same outpoints, and the descendants of
+// all of them. Descendants must go as well, otherwise they stay in the mempool
+// without a parent and every following block template is unminable.
 func (p *Pool) RemoveForBlock(block *wire.MsgBlock) {
+	spent := make(map[string]struct{})
+	for _, tx := range block.Transactions {
+		for _, in := range tx.TxIn {
+			spent[blockchain.OutPointKey(in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)] = struct{}{}
+		}
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, tx := range block.Transactions {
@@ -582,11 +593,17 @@ func (p *Pool) RemoveForBlock(block *wire.MsgBlock) {
 		if err != nil {
 			continue
 		}
-		txid := txHash.String()
-		if _, ok := p.entries[txid]; !ok {
-			continue
+		p.removeEntryLocked(txHash.String(), true)
+	}
+	for txid, entry := range p.entries {
+		for _, in := range entry.Tx.TxIn {
+			key := blockchain.OutPointKey(in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
+			if _, ok := spent[key]; !ok {
+				continue
+			}
+			p.removeEntryLocked(txid, true)
+			break
 		}
-		p.removeEntryLocked(txid, false)
 	}
 }
 
@@ -602,6 +619,11 @@ func validateTransaction(chain *blockchain.Chain, tx *wire.MsgTx, pool *Pool) (s
 		return "", 0, nil, err
 	}
 	txid := txHash.String()
+	if chain.TxIndexEnabled() {
+		if _, idx, _, err := chain.LookupTransactionByIndex(txid); err == nil && idx != nil {
+			return "", 0, nil, fmt.Errorf("transaction already confirmed in block %s", idx.Hash)
+		}
+	}
 	totalOut := int64(0)
 	txSigOps := 0
 	for _, out := range tx.TxOut {

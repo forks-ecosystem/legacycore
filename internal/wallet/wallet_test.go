@@ -1,6 +1,7 @@
 package wallet
 
 import (
+	"fmt"
 	"bytes"
 	"path/filepath"
 	"strings"
@@ -706,4 +707,285 @@ func TestRestorePlainBackupImportsKeysAdditively(t *testing.T) {
 	if !got[classic] || !got[hybrid] {
 		t.Fatalf("restored wallet missing classic=%v hybrid=%v from %v", got[classic], got[hybrid], got)
 	}
+}
+
+// A sweep with fee=0 must fall through to auto-fee, consume every input and emit
+// exactly one output. The auto-fee branch used to reject every sweep because it
+// compared the freshly estimated fee against the already-consumed total, and it
+// reported the pre-fee amount back to the caller.
+func TestSweepAutoFeeConsumesAllInputsAndReportsRealFee(t *testing.T) {
+	w, srcAddr, _, chain, pool := fundedClassicWallet(t)
+	dest, err := w.NewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unspent, err := w.ListUnspentForSpend(chain, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := int64(0)
+	inputs := 0
+	for _, u := range unspent {
+		if u.Locked || u.Address != srcAddr {
+			continue
+		}
+		if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
+			continue
+		}
+		total += u.Value
+		inputs++
+	}
+	if inputs < 2 {
+		t.Fatalf("sweep needs several inputs, got %d", inputs)
+	}
+
+	txid, swept, err := w.Sweep(chain, pool, srcAddr, dest, 0)
+	if err != nil {
+		t.Fatalf("sweep with auto fee: %v", err)
+	}
+	if txid == "" {
+		t.Fatal("empty txid for auto-fee sweep")
+	}
+
+	var found *wire.MsgTx
+	for _, mtx := range pool.Transactions(0) {
+		h, herr := mtx.TxHash()
+		if herr != nil {
+			t.Fatalf("hash swept tx: %v", herr)
+		}
+		if h.String() == txid {
+			found = mtx
+		}
+	}
+	if found == nil {
+		t.Fatal("swept transaction is not in the mempool")
+	}
+	if len(found.TxOut) != 1 {
+		t.Fatalf("sweep must emit exactly one output, got %d", len(found.TxOut))
+	}
+	if len(found.TxIn) != inputs {
+		t.Fatalf("sweep must consume every input: got %d, want %d", len(found.TxIn), inputs)
+	}
+	var outSum int64
+	for _, o := range found.TxOut {
+		outSum += o.Value
+		if o.Value < mempool.DustThreshold {
+			t.Fatalf("sweep produced dust output %d", o.Value)
+		}
+	}
+	if outSum != swept {
+		t.Fatalf("reported swept amount %d does not match the real output %d", swept, outSum)
+	}
+	paid := total - outSum
+	if paid <= 0 {
+		t.Fatalf("no fee deducted: total %d, output %d", total, outSum)
+	}
+	if paid >= total {
+		t.Fatalf("swept amount %d leaves no room for the input total %d", swept, total)
+	}
+}
+
+// An explicit fee must survive untouched so the consolidation panel keeps paying
+// the amount it asked for.
+func TestSweepWithExplicitFeeDeductsExactlyThatFee(t *testing.T) {
+	w, srcAddr, _, chain, pool := fundedClassicWallet(t)
+	dest, err := w.NewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	unspent, err := w.ListUnspentForSpend(chain, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := int64(0)
+	for _, u := range unspent {
+		if u.Locked || u.Address != srcAddr {
+			continue
+		}
+		if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
+			continue
+		}
+		total += u.Value
+	}
+	const fee = int64(20000)
+	txid, swept, err := w.Sweep(chain, pool, srcAddr, dest, fee)
+	if err != nil {
+		t.Fatalf("sweep with explicit fee: %v", err)
+	}
+	if want := total - fee; swept != want {
+		t.Fatalf("explicit fee sweep reported %d, want %d", swept, want)
+	}
+	var outSum int64
+	for _, mtx := range pool.Transactions(0) {
+		h, herr := mtx.TxHash()
+		if herr != nil {
+			t.Fatalf("hash swept tx: %v", herr)
+		}
+		if h.String() != txid {
+			continue
+		}
+		if len(mtx.TxOut) != 1 {
+			t.Fatalf("sweep must emit exactly one output, got %d", len(mtx.TxOut))
+		}
+		for _, o := range mtx.TxOut {
+			outSum += o.Value
+		}
+	}
+	if outSum != total-fee {
+		t.Fatalf("explicit fee sweep output %d, want %d", outSum, total-fee)
+	}
+}
+
+// An empty source address has to draw inputs from every wallet address, so a
+// single transfer can top up an external deposit address with an exact amount
+// even when no single wallet address holds that much.
+func TestSendFromEmptySourceSpansAddressesAndPaysExactAmount(t *testing.T) {
+	w, chain, pool, addrs := fundedMultiAddressWallet(t, 4)
+	dest, err := w.NewAddress()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unspent, err := w.ListUnspentForSpend(chain, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perAddr := map[string]int64{}
+	var total int64
+	for _, u := range unspent {
+		if u.Locked {
+			continue
+		}
+		if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
+			continue
+		}
+		perAddr[u.Address] += u.Value
+		total += u.Value
+	}
+	if len(perAddr) < 4 {
+		t.Fatalf("expected funding across several addresses, got %d", len(perAddr))
+	}
+	var largest int64
+	for _, v := range perAddr {
+		if v > largest {
+			largest = v
+		}
+	}
+
+	// Pick an amount larger than any single address holds, so only a
+	// multi-input selection can satisfy it.
+	amount := largest + largest/2
+	const fee = int64(20000)
+	// Deliberately omit one funded address: an explicit allowlist must keep the
+	// transfer away from any wallet address that was not named.
+	used := addrs[:len(addrs)-1]
+	txid, err := w.SendToAddressFromAddrs(chain, pool, used, dest, amount, fee)
+	if err != nil {
+		t.Fatalf("send from address allowlist: %v", err)
+	}
+
+	var found *wire.MsgTx
+	for _, mtx := range pool.Transactions(0) {
+		h, herr := mtx.TxHash()
+		if herr != nil {
+			t.Fatalf("hash transfer tx: %v", herr)
+		}
+		if h.String() == txid {
+			found = mtx
+		}
+	}
+	if found == nil {
+		t.Fatal("transfer transaction is not in the mempool")
+	}
+	if len(found.TxIn) < 2 {
+		t.Fatalf("expected a multi-input transfer, got %d inputs", len(found.TxIn))
+	}
+
+	destScript, err := destinationScript(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paid, change int64
+	for _, o := range found.TxOut {
+		if bytes.Equal(o.PkScript, destScript) {
+			paid = o.Value
+			continue
+		}
+		change += o.Value
+		if o.Value < mempool.DustThreshold {
+			t.Fatalf("transfer produced dust output %d", o.Value)
+		}
+	}
+	if paid != amount {
+		t.Fatalf("destination received %d, want exact %d", paid, amount)
+	}
+	// Sum only the inputs the wallet actually selected, not the whole wallet:
+	// selection must stop as soon as amount+fee is covered.
+	byOutpoint := map[string]int64{}
+	for _, u := range unspent {
+		byOutpoint[fmt.Sprintf("%s:%d", u.TxID, u.Vout)] = u.Value
+	}
+	var selectedSum int64
+	for _, in := range found.TxIn {
+		key := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
+		v, ok := byOutpoint[key]
+		if !ok {
+			t.Fatalf("selected input %s is not a known wallet utxo", key)
+		}
+		selectedSum += v
+	}
+	if want := selectedSum - amount - fee; change != want {
+		t.Fatalf("change %d does not balance selected inputs %d against amount %d and fee %d", change, selectedSum, amount, fee)
+	}
+	if selectedSum >= total {
+		t.Fatalf("selection consumed the whole wallet (%d of %d) instead of stopping at the requested amount", selectedSum, total)
+	}
+}
+
+// fundedMultiAddressWallet mines mature coinbase blocks to n distinct wallet
+// addresses so no single address can cover a whole transfer.
+func fundedMultiAddressWallet(t *testing.T, n int) (*Wallet, *blockchain.Chain, *mempool.Pool, []string) {
+	t.Helper()
+	w, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs := make([]string, 0, n)
+	hashes := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		addr, err := w.NewAddress()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, hash, err := address.DecodeBase58Check(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		addrs = append(addrs, addr)
+		hashes = append(hashes, hash)
+	}
+	chain, err := blockchain.New(chaincfg.MainNet, fakeHasher{}, storage.NewFileStore(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := mempool.New()
+	var prev chainhash.Hash
+	for i := 0; i <= chaincfg.CoinbaseMaturity+n; i++ {
+		bits, err := chain.NextRequiredBits()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := buildCoinbaseBlock(prev, int32(i), uint32(10_000+i), bits, hashes[i%n])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := chain.ProcessBlock(b); err != nil {
+			t.Fatalf("process block %d: %v", i, err)
+		}
+		prev, err = fakeHasher{}.HashHeader(b.Header)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return w, chain, pool, addrs
 }

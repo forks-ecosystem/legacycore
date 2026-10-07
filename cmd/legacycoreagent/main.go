@@ -97,8 +97,8 @@ func (s *Service) rpcCallOnce(method string, params any) (any, error) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	var result struct {
-		Result any    `json:"result"`
-		Error  any    `json:"error"`
+		Result any `json:"result"`
+		Error  any `json:"error"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, err
@@ -339,9 +339,9 @@ func (s *Service) handleGetMnemonic(w http.ResponseWriter, r *http.Request, name
 	}
 
 	jsonResp(w, 200, map[string]any{
-		"wallet":           name,
-		"mnemonic":         mnemonic,
-		"mnemonic_b64":     base64.StdEncoding.EncodeToString([]byte(mnemonic)),
+		"wallet":            name,
+		"mnemonic":          mnemonic,
+		"mnemonic_b64":      base64.StdEncoding.EncodeToString([]byte(mnemonic)),
 		"mnemonic_numbered": strings.Join(lines, "  "),
 	})
 }
@@ -375,8 +375,8 @@ func (s *Service) handleNewAddress(w http.ResponseWriter, r *http.Request, name 
 	}
 
 	jsonResp(w, 200, map[string]any{
-		"wallet":   name,
-		"address":  addr,
+		"wallet":  name,
+		"address": addr,
 	})
 }
 
@@ -470,9 +470,9 @@ func (s *Service) handleGetBalance(w http.ResponseWriter, r *http.Request, name 
 		}
 	}
 	jsonResp(w, 200, map[string]any{
-		"wallet":   name,
-		"balance":  totalBalance,
-		"received": totalReceived,
+		"wallet":    name,
+		"balance":   totalBalance,
+		"received":  totalReceived,
 		"addresses": len(addrs),
 	})
 }
@@ -516,8 +516,8 @@ func (s *Service) handleGetBalances(w http.ResponseWriter, r *http.Request, name
 		balances = append(balances, ab)
 	}
 	jsonResp(w, 200, map[string]any{
-		"wallet":   name,
-		"balance":  totalBalance,
+		"wallet":    name,
+		"balance":   totalBalance,
 		"addresses": balances,
 	})
 }
@@ -627,12 +627,23 @@ func (s *Service) handleChainHistory(w http.ResponseWriter, chain txsvc.Blockcha
 // {"from":addr,"to":addr,"amount":baseUnits,"fee":baseUnitsOr0,"privateKey":"0x..."}
 // Requires the X-Api-Key header matching LEGACYCOIN_API_KEY so that browser
 // clients hitting the public nginx proxy cannot submit signed sends.
+//
+// The check is fail-closed on purpose. It used to be
+// `if s.apiKey != "" && header != s.apiKey`, which meant an unset key opened
+// the route to anyone who could reach the port. That is only safe while sends
+// need a privateKey the caller already holds; now a send can be authorised
+// purely by naming a node-wallet address as `from`, so an unset key would hand
+// the node's whole balance to any caller. An unconfigured agent must refuse.
 func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address string) {
 	if r.Method != http.MethodPost {
 		jsonErr(w, 405, "send requires POST")
 		return
 	}
-	if s.apiKey != "" && r.Header.Get("X-Api-Key") != s.apiKey {
+	if s.apiKey == "" {
+		jsonErr(w, 503, "send is disabled: LEGACYCOIN_API_KEY is not configured")
+		return
+	}
+	if r.Header.Get("X-Api-Key") != s.apiKey {
 		jsonErr(w, 401, "missing or invalid X-Api-Key")
 		return
 	}
@@ -642,7 +653,11 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 		Amount     int64  `json:"amount"`
 		Fee        int64  `json:"fee"`
 		PrivateKey string `json:"privateKey"`
+		All        bool   `json:"all"`
+		SendAll    bool   `json:"sendAll"`
+		Sweep      bool   `json:"sweep"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, 400, "invalid json")
 		return
@@ -655,7 +670,8 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 		jsonErr(w, 400, "path/from address mismatch")
 		return
 	}
-	res, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey)
+	all := req.All || req.SendAll || req.Sweep
+	res, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey, all)
 	if err != nil {
 		jsonErr(w, 500, err.Error())
 		return
@@ -676,7 +692,11 @@ func (s *Service) handleChainEstimate(w http.ResponseWriter, r *http.Request, ch
 		To         string `json:"to"`
 		Amount     int64  `json:"amount"`
 		PrivateKey string `json:"privateKey"`
+		All        bool   `json:"all"`
+		SendAll    bool   `json:"sendAll"`
+		Sweep      bool   `json:"sweep"`
 	}
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonErr(w, 400, "invalid json")
 		return
