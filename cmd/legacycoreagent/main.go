@@ -80,6 +80,18 @@ func (s *Service) rpcCall(method string, params any) (any, error) {
 }
 
 func (s *Service) rpcCallOnce(method string, params any) (any, error) {
+	return s.rpcCallOnceWallet(method, params, "")
+}
+
+// rpcCallWallet runs an RPC against a named node wallet by setting the
+// X-LegacyCoin-Wallet header, which is how the node selects the wallet (see
+// internal/rpc/server.go). This keeps the node the single writer of its wallet
+// files, so a key derived here is owned and persisted by the node itself.
+func (s *Service) rpcCallWallet(name, method string, params any) (any, error) {
+	return s.rpcCallOnceWallet(method, params, name)
+}
+
+func (s *Service) rpcCallOnceWallet(method string, params any, walletHeader string) (any, error) {
 	if s.rpcURL == "" {
 		return nil, fmt.Errorf("RPC not configured")
 	}
@@ -87,6 +99,9 @@ func (s *Service) rpcCallOnce(method string, params any) (any, error) {
 	body, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", s.rpcURL, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if walletHeader != "" {
+		req.Header.Set("X-LegacyCoin-Wallet", walletHeader)
+	}
 	if s.rpcUser != "" {
 		req.SetBasicAuth(s.rpcUser, s.rpcPass)
 	}
@@ -347,41 +362,60 @@ func (s *Service) handleGetMnemonic(w http.ResponseWriter, r *http.Request, name
 }
 
 // POST /api/wallet/{name}/newaddress
+//
+// Node-owned deposit address. The private key is generated inside the node's
+// wallet and never leaves it: the agent asks the node to derive the address (the
+// node is the single writer of its wallet files), so the exchange can later sign
+// for or sweep it, and a wallet-file/mnemonic backup restores the key. Requires
+// the X-Api-Key header, fail-closed, because a derived key is a spendable node
+// key.
 func (s *Service) handleNewAddress(w http.ResponseWriter, r *http.Request, name string) {
-	dir := s.resolveDir(name)
-	if _, err := os.Stat(filepath.Join(dir, "wallet.json")); os.IsNotExist(err) {
-		jsonErr(w, 404, "wallet not found")
+	if s.apiKey == "" {
+		jsonErr(w, 503, "newaddress is disabled: LEGACYCOIN_API_KEY is not configured")
+		return
+	}
+	if r.Header.Get("X-Api-Key") != s.apiKey {
+		jsonErr(w, 401, "missing or invalid X-Api-Key")
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		jsonErr(w, 400, "wallet name required")
 		return
 	}
 
-	wal, err := wallet.Open(dir)
+	res, err := s.rpcCallWallet(name, "getnewaddress", []any{})
 	if err != nil {
-		jsonErr(w, 500, err.Error())
-		return
-	}
-
-	info := wal.SecurityInfo()
-	if !info["hdseed"].(bool) {
-		if _, err := wal.SetHDSeed(""); err != nil {
-			jsonErr(w, 500, "set seed: "+err.Error())
+		// The wallet may not be loaded in the node yet: create+load it, then
+		// retry exactly once. createwallet is a no-op-ish load when the file
+		// already exists.
+		if _, cerr := s.rpcCall("createwallet", []string{name}); cerr != nil {
+			jsonErr(w, 500, err.Error())
+			return
+		}
+		res, err = s.rpcCallWallet(name, "getnewaddress", []any{})
+		if err != nil {
+			jsonErr(w, 500, err.Error())
 			return
 		}
 	}
 
-	addr, err := wal.NewAddress()
-	if err != nil {
-		jsonErr(w, 500, err.Error())
-		return
-	}
-
 	jsonResp(w, 200, map[string]any{
 		"wallet":  name,
-		"address": addr,
+		"address": res,
 	})
 }
 
 // POST /api/wallet/{name}/newhybridaddress
 func (s *Service) handleNewHybridAddress(w http.ResponseWriter, r *http.Request, name string) {
+	if s.apiKey == "" {
+		jsonErr(w, 503, "newhybridaddress is disabled: LEGACYCOIN_API_KEY is not configured")
+		return
+	}
+	if r.Header.Get("X-Api-Key") != s.apiKey {
+		jsonErr(w, 401, "missing or invalid X-Api-Key")
+		return
+	}
 	dir := s.resolveDir(name)
 	if _, err := os.Stat(filepath.Join(dir, "wallet.json")); os.IsNotExist(err) {
 		jsonErr(w, 404, "wallet not found")
@@ -653,6 +687,7 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 		Amount     int64  `json:"amount"`
 		Fee        int64  `json:"fee"`
 		PrivateKey string `json:"privateKey"`
+		Wallet     string `json:"wallet"`
 		All        bool   `json:"all"`
 		SendAll    bool   `json:"sendAll"`
 		Sweep      bool   `json:"sweep"`
@@ -669,6 +704,18 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 	if address != "" && req.From != address {
 		jsonErr(w, 400, "path/from address mismatch")
 		return
+	}
+	// Optional node-wallet override: the registered chain is pinned to the
+	// configured hot wallet, but a caller may need this one send to spend from a
+	// different named wallet (e.g. the `users` float funding a withdrawal). The
+	// node selects the source UTXOs, so only the wallet header changes.
+	if req.Wallet != "" {
+		lbtc, ok := chain.(*txsvc.LBTC)
+		if !ok {
+			jsonErr(w, 400, "wallet override is not supported for this coin")
+			return
+		}
+		chain = lbtc.WithNodeWallet(req.Wallet)
 	}
 	all := req.All || req.SendAll || req.Sweep
 	res, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey, all)
@@ -745,7 +792,8 @@ func main() {
 	svc := NewService(dataDir)
 
 	signer := getEnv("LEGACYCOIN_SIGNER_URL", "http://127.0.0.1:8053")
-	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetSignerURL(signer))
+	hotWallet := getEnv("LEGACYCOIN_HOT_WALLET", "exchange")
+	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetNodeWallet(hotWallet).SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("KAS", "https://api.kaspa.org").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("GOR", "https://api.gor.forks.life").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("BTM", "https://api.btm.forks.life").SetSignerURL(signer))

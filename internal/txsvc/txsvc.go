@@ -174,11 +174,23 @@ type RPCClient struct {
 	url      string
 	user     string
 	pass     string
+	wallet   string
 	attempts int
 }
 
 func NewRPCClient(url, user, pass string) *RPCClient {
 	return &RPCClient{url: url, user: user, pass: pass, attempts: 3}
+}
+
+// WithWallet returns a copy of the client that pins every call to a named node
+// wallet via the X-LegacyCoin-Wallet header. Most RPCs are wallet-agnostic, but
+// getbalance/sendtoaddress/sweepallraw operate on a single wallet, and without
+// the header the node uses "default" - which is not necessarily where the hot
+// float lives.
+func (c *RPCClient) WithWallet(wallet string) *RPCClient {
+	cp := *c
+	cp.wallet = wallet
+	return &cp
 }
 
 func (c *RPCClient) Call(method string, params any) (any, error) {
@@ -202,6 +214,9 @@ func (c *RPCClient) callOnce(method string, params any) (any, error) {
 	body, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", c.url, bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if c.wallet != "" {
+		req.Header.Set("X-LegacyCoin-Wallet", c.wallet)
+	}
 	if c.user != "" {
 		req.SetBasicAuth(c.user, c.pass)
 	}

@@ -17,11 +17,52 @@ import (
 // the balance RPC gives us both confirmed sompi and display units.
 type LBTC struct {
 	rpc       *RPCClient
+	rpcURL    string
+	rpcUser   string
+	rpcPass   string
+	hotRPC    *RPCClient
 	signerURL string
 }
 
 func NewLBTC(rpcURL, user, pass string) *LBTC {
-	return &LBTC{rpc: NewRPCClient(rpcURL, user, pass), signerURL: "http://127.0.0.1:8053"}
+	return &LBTC{
+		rpc:       NewRPCClient(rpcURL, user, pass),
+		rpcURL:    rpcURL,
+		rpcUser:   user,
+		rpcPass:   pass,
+		signerURL: "http://127.0.0.1:8053",
+	}
+}
+
+// SetNodeWallet pins the node-signed spend path (walletBalance, sendtoaddress,
+// sweepallraw) to a named node wallet. Empty keeps the previous behaviour of
+// using the node's default wallet.
+func (b *LBTC) SetNodeWallet(wallet string) *LBTC {
+	wallet = strings.TrimSpace(wallet)
+	if wallet == "" {
+		b.hotRPC = nil
+		return b
+	}
+	b.hotRPC = NewRPCClient(b.rpcURL, b.rpcUser, b.rpcPass).WithWallet(wallet)
+	return b
+}
+
+// WithNodeWallet returns a shallow copy bound to a different named node wallet,
+// leaving the receiver (the registered chain) untouched. Used to route a single
+// send through a wallet other than the configured hot wallet, e.g. to let the
+// `users` float pay a user withdrawal.
+func (b *LBTC) WithNodeWallet(wallet string) *LBTC {
+	cp := *b
+	cp.SetNodeWallet(wallet)
+	return &cp
+}
+
+// sendRPC is the client used for wallet-scoped spend/balance RPCs.
+func (b *LBTC) sendRPC() *RPCClient {
+	if b.hotRPC != nil {
+		return b.hotRPC
+	}
+	return b.rpc
 }
 
 func (b *LBTC) SetSignerURL(url string) *LBTC {
@@ -289,7 +330,7 @@ func (b *LBTC) SendFromNodeWallet(to string, amount, fee int64, all ...bool) (Se
 	if fee > 0 {
 		params = append(params, formatLBTCTx(fee))
 	}
-	raw, err := b.rpc.Call("sendtoaddress", params)
+	raw, err := b.sendRPC().Call("sendtoaddress", params)
 	if err != nil {
 		return res, fmt.Errorf("sendtoaddress: %v", err)
 	}
@@ -331,7 +372,7 @@ func (b *LBTC) SweepNodeWallet(from, to string, fee int64) (SendResult, error) {
 	} else if !info.IsValid {
 		return res, fmt.Errorf("invalid destination address")
 	}
-	raw, err := b.rpc.Call("sweepallraw", []any{from, to, fee})
+	raw, err := b.sendRPC().Call("sweepallraw", []any{from, to, fee})
 	if err != nil {
 		return res, fmt.Errorf("sweepallraw: %v", err)
 	}
@@ -362,7 +403,7 @@ func (b *LBTC) SweepNodeWallet(from, to string, fee int64) (SendResult, error) {
 // that as base units would understate the balance a millionfold and reject
 // every real withdrawal, so both the numeric and the string case scale up.
 func (b *LBTC) walletBalance() (int64, error) {
-	res, err := b.rpc.Call("getbalance", []any{"*"})
+	res, err := b.sendRPC().Call("getbalance", []any{"*"})
 	if err != nil {
 		return 0, fmt.Errorf("getbalance: %v", err)
 	}
