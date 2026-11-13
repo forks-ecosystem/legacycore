@@ -8,7 +8,7 @@ require (
 	github.com/ethereum/go-ethereum v1.15.11
 	github.com/tyler-smith/go-bip39 v1.1.0
 	github.com/wailsapp/wails/v2 v2.12.0
-	golang.org/x/crypto v0.53.0
+	golang.org/x/crypto v0.58.0
 )
 
 require (
@@ -22,7 +22,7 @@ require (
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/mmcloughlin/addchain v0.4.0 // indirect
 	github.com/supranational/blst v0.3.14 // indirect
-	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/sync v0.24.0 // indirect
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
@@ -53,7 +53,7 @@ require (
 	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )
