@@ -38,7 +38,20 @@ LOGFILE = os.path.join(DATADIR, "archive-zero.log")
 BACKUP_KEEP = 2
 
 RPC_URL = os.environ.get("LEGACYCOIN_RPC_URL", "http://127.0.0.1:19556")
-RPC_AUTH = os.environ.get("LEGACYCOIN_RPC_AUTH", "coin:coin")
+def _default_rpc_auth():
+    # The node runs cookie-only (2026-11-12): static rpcuser/rpcpassword are
+    # gone from legacycoin.conf, auth comes from the datadir .cookie, re-read
+    # per process start so a rotated cookie is picked up on the next run.
+    try:
+        raw = open("/home/coin/.legacycoin/.cookie").read().strip()
+        if ":" in raw:
+            return raw
+    except OSError:
+        pass
+    return "coin:coin"  # pre-cookie-only fallback, kept for old snapshots
+
+
+RPC_AUTH = os.environ.get("LEGACYCOIN_RPC_AUTH") or _default_rpc_auth()
 
 
 def log(msg):
