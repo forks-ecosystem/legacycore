@@ -2,17 +2,22 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	_ "github.com/lib/pq"
 
 	"legacycoin/legacy-go/internal/txsvc"
 	"legacycoin/legacy-go/internal/wallet"
@@ -23,23 +28,119 @@ type Service struct {
 	rpcURL  string
 	rpcUser string
 	rpcPass string
+	rpcCookiePath string // например /home/coin/.legacycoin/.cookie
 	chains  *txsvc.Manager
 	apiKey  string
+	// db is the optional wallet_db audit connection (system_wallets /
+	// wallet_requests). nil means audit logging is disabled.
+	db *sql.DB
 }
 
 func NewService(dataDir string) *Service {
-	rpcURL := getEnv("LEGACYCOIN_RPC_URL", "")
-	rpcUser := getEnv("LEGACYCOIN_RPC_USER", "")
-	rpcPass := getEnv("LEGACYCOIN_RPC_PASS", "")
+	rpcURL        := getEnv("LEGACYCOIN_RPC_URL", "")
+	rpcUser       := getEnv("LEGACYCOIN_RPC_USER", "")
+	rpcPass       := getEnv("LEGACYCOIN_RPC_PASS", "")
+	rpcCookiePath := getEnv("LEGACYCOIN_COOKIE_PATH","")
 
-	return &Service{
+	svc := &Service{
 		dataDir: dataDir,
 		rpcURL:  rpcURL,
 		rpcUser: rpcUser,
 		rpcPass: rpcPass,
+		rpcCookiePath: rpcCookiePath,
 		chains:  txsvc.NewManager(),
 		apiKey:  getEnv("LEGACYCOIN_API_KEY", ""),
 	}
+
+	// Optional audit sink. Fail-open: if the DB is unreachable the agent keeps
+	// serving, it just does not record wallet_requests.
+	if dsn := getEnv("LEGACYCOIN_WALLET_DB_DSN", ""); dsn != "" {
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			log.Printf("audit: open wallet_db: %v (audit disabled)", err)
+		} else if err := db.Ping(); err != nil {
+			log.Printf("audit: ping wallet_db: %v (audit disabled)", err)
+			db.Close()
+		} else {
+			svc.db = db
+			log.Printf("audit: wallet_db connected")
+		}
+	}
+	return svc
+}
+
+// clientIP extracts the peer IP from a request without the port.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ensureWallet resolves a system_wallets row for address, creating it if
+// missing, and returns its id. ownerType defaults to 'system'.
+func (s *Service) ensureWallet(currency, network, address, ownerType, purpose, label string, userID *int) (int64, error) {
+	if s.db == nil {
+		return 0, fmt.Errorf("audit disabled")
+	}
+	if ownerType == "" {
+		ownerType = "system"
+	}
+	var id int64
+	err := s.db.QueryRow(`
+		INSERT INTO system_wallets (currency, network, address, owner_type, purpose, label, user_id)
+		VALUES ($1, NULLIF($2,''), $3, $4, NULLIF($5,''), NULLIF($6,''), $7)
+		ON CONFLICT (address) DO UPDATE SET address = EXCLUDED.address
+		RETURNING id`,
+		currency, network, address, ownerType, purpose, label, userID,
+	).Scan(&id)
+	return id, err
+}
+
+// logRequest appends a row to wallet_requests. It never returns an error to the
+// caller: audit failures are logged and swallowed so they cannot break serving.
+func (s *Service) logRequest(walletID int64, userID, actorID *int, actorType, action, ip, ua, sessionID, txHash string, amount *int64, meta map[string]any) {
+	if s.db == nil {
+		return
+	}
+	if actorType == "" {
+		actorType = "system"
+	}
+	var metaStr any
+	if meta != nil {
+		if b, err := json.Marshal(meta); err == nil {
+			metaStr = string(b)
+		}
+	}
+	var amt any
+	if amount != nil {
+		amt = *amount
+	}
+	if _, err := s.db.Exec(`
+		INSERT INTO wallet_requests
+		  (wallet_id, user_id, actor_id, actor_type, action, ip, user_agent, session_id, tx_hash, amount, metadata)
+		VALUES ($1,$2,$3,$4,CAST($5 AS wallet_action),NULLIF($6,'')::inet,NULLIF($7,''),NULLIF($8,''),NULLIF($9,''),$10,$11::jsonb)`,
+		walletID, userID, actorID, actorType, action, ip, ua, sessionID, txHash, amt, metaStr,
+	); err != nil {
+		log.Printf("audit: insert wallet_requests (%s): %v", action, err)
+	}
+}
+
+// extractTxHash pulls a tx id out of a chain send response, which may be a
+// string or a map with txid/hash.
+func extractTxHash(res any) string {
+	switch v := res.(type) {
+	case string:
+		return v
+	case map[string]any:
+		for _, k := range []string{"txid", "txId", "hash", "txHash"} {
+			if s, ok := v[k].(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Service) walletDir(name string) string {
@@ -92,38 +193,91 @@ func (s *Service) rpcCallWallet(name, method string, params any) (any, error) {
 }
 
 func (s *Service) rpcCallOnceWallet(method string, params any, walletHeader string) (any, error) {
-	if s.rpcURL == "" {
-		return nil, fmt.Errorf("RPC not configured")
-	}
-	reqBody := map[string]any{"method": method, "params": params, "id": 1}
-	body, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequest("POST", s.rpcURL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	if walletHeader != "" {
-		req.Header.Set("X-LegacyCoin-Wallet", walletHeader)
-	}
-	if s.rpcUser != "" {
-		req.SetBasicAuth(s.rpcUser, s.rpcPass)
-	}
-	resp, err := http.DefaultClient.Do(req)
+    if s.rpcURL == "" {
+	return nil, fmt.Errorf("RPC not configured")
+    }
+
+    user, pass := s.rpcUser, s.rpcPass
+    if user == "" && s.rpcCookiePath != "" {
+	var err error
+	user, pass, err = loadRPCCookie(s.rpcCookiePath)
 	if err != nil {
-		return nil, err
+	    return nil, fmt.Errorf("rpc cookie: %w", err)
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	var result struct {
-		Result any `json:"result"`
-		Error  any `json:"error"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, err
-	}
-	if result.Error != nil {
-		return nil, fmt.Errorf("%v", result.Error)
-	}
-	return result.Result, nil
+    }
+
+    reqBody := map[string]any{
+	"jsonrpc": "1.0",
+	"method":  method,
+	"params":  params,
+	"id":      1,
+    }
+    body, err := json.Marshal(reqBody)
+    if err != nil {
+	return nil, err
+    }
+
+    req, err := http.NewRequest(http.MethodPost, s.rpcURL, bytes.NewReader(body))
+    if err != nil {
+	return nil, err
+    }
+    req.Header.Set("Content-Type", "application/json")
+    if walletHeader != "" {
+	req.Header.Set("X-LegacyCoin-Wallet", walletHeader)
+    }
+    if user != "" {
+	req.SetBasicAuth(user, pass)
+    }
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+	return nil, err
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+	return nil, err
+    }
+
+    // не JSON (Unauthorized и т.п.)
+    if len(respBody) == 0 || (respBody[0] != '{' && respBody[0] != '[') {
+	return nil, fmt.Errorf("rpc status=%d non-json: %s", resp.StatusCode, truncateForErr(string(respBody), 200))
+    }
+
+    var result struct {
+	Result any `json:"result"`
+	Error  any `json:"error"`
+    }
+    if err := json.Unmarshal(respBody, &result); err != nil {
+	return nil, fmt.Errorf("rpc json: %w; body=%s", err, truncateForErr(string(respBody), 200))
+    }
+    if result.Error != nil {
+	return nil, fmt.Errorf("%v", result.Error)
+    }
+    return result.Result, nil
 }
 
+func truncateForErr(s string, n int) string {
+    s = strings.TrimSpace(s)
+    if len(s) <= n {
+	return s
+    }
+    return s[:n] + "..."
+}
+
+func loadRPCCookie(path string) (user, pass string, err error) {
+    b, err := os.ReadFile(path)
+    if err != nil {
+	return "", "", err
+    }
+    line := strings.TrimSpace(string(b))
+    user, pass, ok := strings.Cut(line, ":")
+    if !ok || pass == "" {
+	return "", "", fmt.Errorf("invalid rpc cookie file %q", path)
+    }
+    return user, pass, nil
+}
 // POST /api/generate-seed
 // Body: {"name": "my-wallet", "address_count": 5}  (address_count optional, default 1)
 func (s *Service) handleGenerateSeed(w http.ResponseWriter, r *http.Request) {
@@ -185,6 +339,8 @@ func (s *Service) handleGenerateSeed(w http.ResponseWriter, r *http.Request) {
 		hybridAddr = ""
 	}
 
+	s.auditCreate(r, req.Name, addrs, "agent:generate-seed")
+
 	jsonResp(w, 200, map[string]any{
 		"wallet":          req.Name,
 		"mnemonic":        wal.Mnemonic(),
@@ -193,6 +349,21 @@ func (s *Service) handleGenerateSeed(w http.ResponseWriter, r *http.Request) {
 		"addresses":       addrs,
 		"hybrid_address":  hybridAddr,
 	})
+}
+
+// auditCreate records a wallet/address creation in wallet_requests, registering
+// the first address in system_wallets so the row has a wallet_id.
+func (s *Service) auditCreate(r *http.Request, name string, addrs []string, source string) {
+	if s.db == nil || len(addrs) == 0 {
+		return
+	}
+	wid, err := s.ensureWallet("LBTC", "lbtc", addrs[0], "system", "wallet_root", name, nil)
+	if err != nil {
+		log.Printf("audit: ensureWallet (%s): %v", name, err)
+		return
+	}
+	s.logRequest(wid, nil, nil, "system", "create", clientIP(r), r.UserAgent(), "", "", nil,
+		map[string]any{"source": source, "wallet": name, "addresses": len(addrs)})
 }
 
 // POST /api/restore-wallet
@@ -257,6 +428,8 @@ func (s *Service) handleRestoreWallet(w http.ResponseWriter, r *http.Request) {
 		hybridAddr = ""
 	}
 
+	s.auditCreate(r, req.Name, addrs, "agent:restore-wallet")
+
 	jsonResp(w, 200, map[string]any{
 		"wallet":          req.Name,
 		"mnemonic":        wal.Mnemonic(),
@@ -266,7 +439,7 @@ func (s *Service) handleRestoreWallet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /api/wallet/{name}
+// POST /api/wallet/{name}
 func (s *Service) handleGetWallet(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/wallet/")
 	path = strings.TrimSpace(path)
@@ -287,6 +460,12 @@ func (s *Service) handleGetWallet(w http.ResponseWriter, r *http.Request) {
 		s.handleNewHybridAddress(w, r, name)
 		return
 	}
+
+        if strings.HasSuffix(path, "/listunspent") {
+            name := strings.TrimSuffix(path, "/listunspent")
+            s.handleListUnspent(w, r, name)
+            return
+        }
 
 	if strings.HasSuffix(path, "/balance") {
 		name := strings.TrimSuffix(path, "/balance")
@@ -353,6 +532,15 @@ func (s *Service) handleGetMnemonic(w http.ResponseWriter, r *http.Request, name
 		lines = append(lines, fmt.Sprintf("%2d. %s", i+1, w))
 	}
 
+	if s.db != nil {
+		if addrs := wal.ListAddresses(); len(addrs) > 0 {
+			if wid, err := s.ensureWallet("LBTC", "lbtc", addrs[0], "system", "wallet_root", name, nil); err == nil {
+				s.logRequest(wid, nil, nil, "system", "key_access", clientIP(r), r.UserAgent(), "", "", nil,
+					map[string]any{"purpose": "mnemonic_export", "wallet": name})
+			}
+		}
+	}
+
 	jsonResp(w, 200, map[string]any{
 		"wallet":            name,
 		"mnemonic":          mnemonic,
@@ -384,6 +572,17 @@ func (s *Service) handleNewAddress(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
+	// Optional audit metadata. Body may be empty (existing callers send none).
+	var opt struct {
+		Currency  string `json:"currency"`
+		Network   string `json:"network"`
+		OwnerType string `json:"owner_type"`
+		Purpose   string `json:"purpose"`
+		Label     string `json:"label"`
+		UserID    *int   `json:"user_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&opt)
+
 	res, err := s.rpcCallWallet(name, "getnewaddress", []any{})
 	if err != nil {
 		// The wallet may not be loaded in the node yet: create+load it, then
@@ -397,6 +596,25 @@ func (s *Service) handleNewAddress(w http.ResponseWriter, r *http.Request, name 
 		if err != nil {
 			jsonErr(w, 500, err.Error())
 			return
+		}
+	}
+
+	if s.db != nil {
+		if address, ok := res.(string); ok && address != "" {
+			currency := opt.Currency
+			if currency == "" {
+				currency = "LBTC"
+			}
+			network := opt.Network
+			if network == "" {
+				network = strings.ToLower(currency)
+			}
+			if wid, err := s.ensureWallet(currency, network, address, opt.OwnerType, opt.Purpose, opt.Label, opt.UserID); err != nil {
+				log.Printf("audit: ensureWallet (%s): %v", address, err)
+			} else {
+				s.logRequest(wid, opt.UserID, nil, "system", "create", clientIP(r), r.UserAgent(), "", "", nil,
+					map[string]any{"source": "agent:newaddress", "wallet": name, "coin": currency})
+			}
 		}
 	}
 
@@ -469,6 +687,95 @@ func (s *Service) handleListWallets(w http.ResponseWriter, r *http.Request) {
 
 	jsonResp(w, 200, map[string]any{"wallets": names})
 }
+// GET /api/wallet/{name}/listunspent?minconf=1&maxconf=9999999
+// Возвращает UTXO кошелька. 
+func (s *Service) handleListUnspent(w http.ResponseWriter, r *http.Request, name string) {
+    if r.Method != http.MethodGet {
+	jsonErr(w, 405, "method not allowed")
+	return
+    }
+    name = strings.TrimSpace(name)
+    if name == "" {
+	jsonErr(w, 400, "wallet name required")
+	return
+    }
+
+    // 1. проверить, что кошелёк существует на диске (как в handleGetBalance)
+    dir := s.resolveDir(name)
+    if _, err := os.Stat(filepath.Join(dir, "wallet.json")); os.IsNotExist(err) {
+	jsonErr(w, 404, "wallet not found: "+name)
+	return
+    }
+
+    // 2. parse minconf/maxconf
+    minconf := 1
+    if v := r.URL.Query().Get("minconf"); v != "" {
+	if n, err := strconv.Atoi(v); err == nil {
+	    minconf = n
+	}
+    }
+    maxconf := 9999999
+    if v := r.URL.Query().Get("maxconf"); v != "" {
+	if n, err := strconv.Atoi(v); err == nil {
+	    maxconf = n
+	}
+    }
+
+    // 3. listunspent с заголовком X-LegacyCoin-Wallet (метод сервиса)
+    raw, err := s.rpcCallWallet(name, "listunspent", []any{minconf, maxconf})
+    if err != nil {
+	jsonResp(w, 503, map[string]any{
+	    "error":  "listunspent failed: " + err.Error(),
+	    "code":   "rpc_error",
+	    "wallet": name,
+	})
+	return
+    }
+
+    // 4. нормализация: amount_base_units ↔ amount
+    arr, ok := raw.([]any)
+    if !ok {
+        jsonResp(w, 500, map[string]any{
+            "error":  fmt.Sprintf("listunspent: unexpected type %T", raw),
+            "code":   "decode_error",
+            "wallet": name,
+        })
+        return
+    }
+
+    utxos := make([]map[string]any, 0, len(arr))
+    for _, v := range arr {
+        if m, ok := v.(map[string]any); ok {
+            utxos = append(utxos, m)
+        }
+    }
+
+    var total int64
+    for _, u := range utxos {
+	if v, ok := u["amount_base_units"].(float64); ok {
+	    u["amount"] = v / 1e8
+	    total += int64(v)
+	} else if v, ok := u["amount"].(float64); ok {
+	    total += int64(v * 1e8)
+	    u["amount_base_units"] = int64(v * 1e8)
+	}
+	if _, ok := u["confirmations"]; !ok {
+	    u["confirmations"] = 0
+	}
+    }
+
+    jsonResp(w, 200, map[string]any{
+	"wallet":           name,
+	"wallet_loaded":    true,
+	"count":            len(utxos),
+	"total_base_units": total,
+	"total":            float64(total) / 1e8,
+	"minconf":          minconf,
+	"maxconf":          maxconf,
+	"utxos":            utxos,
+    })
+}
+
 
 // GET /api/wallet/{name}/balance
 func (s *Service) handleGetBalance(w http.ResponseWriter, r *http.Request, name string) {
@@ -586,6 +893,25 @@ func (s *Service) handleChain(w http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "balance":
 		s.handleChainBalance(w, chain, rest)
+	case "gasbalance":
+		// Native-gas (BNB) balance for the EVM chains: the hot float must hold
+		// gas to pay any transfer, and this is the number the operators watch.
+		if bc, ok := chain.(txsvc.BEP20TokenChain); ok {
+			native, err := bc.NativeBalance(rest)
+			if err != nil {
+				jsonErr(w, 500, err.Error())
+				return
+			}
+			wei := native.Int64()
+			jsonResp(w, 200, map[string]any{
+				"symbol":  "BNB",
+				"address": rest,
+				"wei":     wei,
+				"balance": fmt.Sprintf("%.10f", float64(wei)/1e18),
+			})
+			return
+		}
+		jsonErr(w, 404, "coin does not expose a native gas balance")
 	case "utxos":
 		s.handleChainUtxos(w, r, chain, rest)
 	case "validate":
@@ -595,10 +921,84 @@ func (s *Service) handleChain(w http.ResponseWriter, r *http.Request) {
 	case "estimate":
 		s.handleChainEstimate(w, r, chain, rest)
 	case "send":
-		s.handleChainSend(w, r, chain, rest)
+		s.handleChainSend(w, r, chain, rest, coin)
+	case "rpc":
+		s.handleChainRPC(w, r, coin)
 	default:
 		jsonErr(w, 400, "unknown op "+op)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Raw JSON-RPC pass-through (POST /api/chain/{coin}/rpc)
+//
+// The high-level ops cover the common flows, but the operational scripts
+// (deposit monitor, ledger sync, treasury funding) still need node-level
+// methods the agent does not wrap individually: getaddresstxids,
+// getrawtransaction, gettransaction, sweepallraw, getwalletsummary... Rather
+// than adding an op per method, the node-backed chain exposes a pass-through.
+// Scope guards:
+//   - only the node-backed chain (lbtc) serves it: every other registered
+//     chain is a REST/scan driver with no JSON-RPC surface to proxy;
+//   - X-Api-Key required, because the op can spend (sweepallraw,
+//     sendtoaddress) and, if misused, reach key-export methods;
+//   - credential and lifecycle methods are refused unconditionally.
+// ---------------------------------------------------------------------------
+
+var rpcForbiddenMethods = map[string]bool{
+	"dumpprivkey": true, "dumpprivatekeys": true, "dumpwallet": true,
+	"backupwallet": true, "importprivkey": true, "importwallet": true,
+	"encryptwallet": true, "walletpassphrase": true, "walletpassphrasechange": true,
+	"stop": true,
+}
+
+func (s *Service) handleChainRPC(w http.ResponseWriter, r *http.Request, coin string) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "rpc requires POST")
+		return
+	}
+	if coin != "lbtc" {
+		jsonErr(w, 404, "rpc pass-through is only served for the node-backed chain (lbtc)")
+		return
+	}
+	if s.apiKey == "" {
+		jsonErr(w, 503, "rpc is disabled: LEGACYCOIN_API_KEY is not configured")
+		return
+	}
+	if r.Header.Get("X-Api-Key") != s.apiKey {
+		jsonErr(w, 401, "missing or invalid X-Api-Key")
+		return
+	}
+	var req struct {
+		Method string `json:"method"`
+		Params []any  `json:"params"`
+		Wallet string `json:"wallet"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		jsonErr(w, 400, "invalid JSON body")
+		return
+	}
+	method := strings.ToLower(strings.TrimSpace(req.Method))
+	if method == "" {
+		jsonErr(w, 400, "method is required")
+		return
+	}
+	if rpcForbiddenMethods[method] {
+		log.Printf("chain rpc pass-through refused: %s from %s", method, r.RemoteAddr)
+		jsonErr(w, 403, "rpc method is refused by the pass-through policy: "+method)
+		return
+	}
+	params := req.Params
+	if params == nil {
+		params = []any{}
+	}
+	result, err := s.rpcCallOnceWallet(req.Method, params, req.Wallet)
+	if err != nil {
+		jsonErr(w, 502, err.Error())
+		return
+	}
+	log.Printf("chain rpc pass-through: %s wallet=%q", method, req.Wallet)
+	jsonResp(w, 200, map[string]any{"method": req.Method, "wallet": req.Wallet, "result": result})
 }
 
 func (s *Service) handleChainBalance(w http.ResponseWriter, chain txsvc.Blockchain, address string) {
@@ -668,7 +1068,7 @@ func (s *Service) handleChainHistory(w http.ResponseWriter, chain txsvc.Blockcha
 // need a privateKey the caller already holds; now a send can be authorised
 // purely by naming a node-wallet address as `from`, so an unset key would hand
 // the node's whole balance to any caller. An unconfigured agent must refuse.
-func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address string) {
+func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain txsvc.Blockchain, address, coin string) {
 	if r.Method != http.MethodPost {
 		jsonErr(w, 405, "send requires POST")
 		return
@@ -691,6 +1091,10 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 		All        bool   `json:"all"`
 		SendAll    bool   `json:"sendAll"`
 		Sweep      bool   `json:"sweep"`
+		// BEP-20 extension: token amounts (8dp scale) ride as strings because
+		// they overflow the int64 field, and the gas-price cap is optional.
+		TokenAmount string `json:"tokenAmount"`
+		GasPriceWei string `json:"gasPriceWei"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -718,11 +1122,57 @@ func (s *Service) handleChainSend(w http.ResponseWriter, r *http.Request, chain 
 		chain = lbtc.WithNodeWallet(req.Wallet)
 	}
 	all := req.All || req.SendAll || req.Sweep
-	res, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey, all)
-	if err != nil {
-		jsonErr(w, 500, err.Error())
-		return
+
+	// BEP-20 path: token amounts are 8dp-scaled decimals too large for the
+	// int64 request field (in wei scale 9.2 USDT already overflow int64), so
+	// they travel as strings and are routed to the typed token transfer.
+	var res any
+	if strings.TrimSpace(req.TokenAmount) != "" {
+		units, ok := new(big.Int).SetString(strings.TrimSpace(req.TokenAmount), 10)
+		if !ok || !units.IsInt64() {
+			jsonErr(w, 400, "invalid tokenAmount: expected an 8dp-scale decimal integer")
+			return
+		}
+		gasCap := int64(0)
+		if gp := strings.TrimSpace(req.GasPriceWei); gp != "" {
+			v, ok := new(big.Int).SetString(gp, 10)
+			if !ok || !v.IsInt64() {
+				jsonErr(w, 400, "invalid gasPriceWei")
+				return
+			}
+			gasCap = v.Int64()
+		}
+		tc, ok := chain.(txsvc.BEP20TokenChain)
+		if !ok {
+			jsonErr(w, 400, "coin does not support token transfers")
+			return
+		}
+		r, err := tc.SignTokenTransfer(req.From, req.To, units.Int64(), gasCap, req.PrivateKey)
+		if err != nil {
+			jsonErr(w, 500, err.Error())
+			return
+		}
+		res = r
+	} else {
+		r, err := chain.SignAndSend(req.From, req.To, req.Amount, req.Fee, req.PrivateKey, all)
+		if err != nil {
+			jsonErr(w, 500, err.Error())
+			return
+		}
+		res = r
 	}
+
+	if s.db != nil {
+		cur := strings.ToUpper(coin)
+		if wid, werr := s.ensureWallet(cur, strings.ToLower(coin), req.From, "system", "hot", "", nil); werr != nil {
+			log.Printf("audit: ensureWallet (%s): %v", req.From, werr)
+		} else {
+			amt := req.Amount
+			s.logRequest(wid, nil, nil, "system", "send", clientIP(r), r.UserAgent(), "", extractTxHash(res), &amt,
+				map[string]any{"from": req.From, "to": req.To, "fee": req.Fee, "coin": cur, "wallet": req.Wallet})
+		}
+	}
+
 	jsonResp(w, 200, res)
 }
 
@@ -742,6 +1192,9 @@ func (s *Service) handleChainEstimate(w http.ResponseWriter, r *http.Request, ch
 		All        bool   `json:"all"`
 		SendAll    bool   `json:"sendAll"`
 		Sweep      bool   `json:"sweep"`
+		// BEP-20 extension (same as the send route above).
+		TokenAmount string `json:"tokenAmount"`
+		GasPriceWei string `json:"gasPriceWei"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -766,6 +1219,35 @@ func (s *Service) handleChainEstimate(w http.ResponseWriter, r *http.Request, ch
 			jsonResp(w, 200, res)
 			return
 		}
+	}
+	// BEP-20 extension: token estimate rides on the string amount.
+	if ta := strings.TrimSpace(req.TokenAmount); ta != "" {
+		units, ok := new(big.Int).SetString(ta, 10)
+		if !ok || !units.IsInt64() {
+			jsonErr(w, 400, "invalid tokenAmount: expected an 8dp-scale decimal integer")
+			return
+		}
+		gasCap := int64(0)
+		if gp := strings.TrimSpace(req.GasPriceWei); gp != "" {
+			v, ok := new(big.Int).SetString(gp, 10)
+			if !ok || !v.IsInt64() {
+				jsonErr(w, 400, "invalid gasPriceWei")
+				return
+			}
+			gasCap = v.Int64()
+		}
+		tc, ok := chain.(txsvc.BEP20TokenChain)
+		if !ok {
+			jsonErr(w, 400, "coin does not support token transfers")
+			return
+		}
+		res, err := tc.EstimateTokenTransfer(req.From, req.To, units.Int64(), gasCap, req.PrivateKey)
+		if err != nil {
+			jsonErr(w, 500, err.Error())
+			return
+		}
+		jsonResp(w, 200, res)
+		return
 	}
 	est, ok := chain.(txsvc.Estimator)
 	if !ok {
@@ -802,7 +1284,17 @@ func main() {
 	svc.chains.Register(txsvc.NewKaspaRest("KASV2", "https://api.kasv2.forks.life").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewBitcoin("https://blockstream.info/api").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewEtherscanReads("ETH", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
-	svc.chains.Register(txsvc.NewEtherscanReads("USDT", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
+	svc.chains.Register(txsvc.NewEtherscanReads("ETH", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
+	// USDT trades on BSC (BEP-20): Etherscan's free plan cannot read chainid 56,
+	// so the chain talks to the public BSC RPC pool instead — and handles its
+	// own signed transfers, which the read-only Etherscan driver never could.
+	// The hot-wallet key file is read per send, so replacing the float means
+	// swapping one file, not restarting the agent.
+	const bscUSDTToken = "0x55d3983262b92601669CA127e6b2313b6d8bE13e"
+	usdt := txsvc.NewBscErc20("USDT", getEnv("BSC_USDT_TOKEN", bscUSDTToken), 18).
+		SetRPCs(strings.Split(getEnv("BSC_RPC_URLS", ""), ",")).
+		SetHotKeyFile(getEnv("USDT_HOT_KEY_FILE", ""))
+	svc.chains.Register(usdt)
 	svc.chains.Register(txsvc.NewEtherscanReads("XHT", "1", getEnv("ETHERSCAN_API_KEY", "5QXTCSV96PXKCBGDHXT83R5DPAFTHGEBEZ")))
 	svc.chains.Register(txsvc.NewSolanaReads("SOL"))
 	svc.chains.Register(txsvc.NewSolanaReads("TRUMP"))
@@ -814,14 +1306,22 @@ func main() {
 	http.HandleFunc("/api/wallets", svc.handleListWallets)
 	http.HandleFunc("/api/chain/", svc.handleChain)
 
-	addr := host + ":" + port
+	addrs := make([]string, 0, 2)
+	for _, h := range strings.Split(host, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			addrs = append(addrs, h+":"+port)
+		}
+	}
+	if len(addrs) == 0 {
+		log.Fatalf("LEGACYCOIN_HOST=%q yields no listen address", host)
+	}
 	fmt.Println("========================================")
 	fmt.Println("  legacycoreagent - Wallet API Service")
 	fmt.Println("========================================")
 	fmt.Printf("  Port:   %s\n", port)
 	fmt.Printf("  Host:   %s\n", host)
 	fmt.Printf("  Data:   %s\n", dataDir)
-	fmt.Printf("  Listen: %s\n", addr)
+	fmt.Printf("  Listen: %s\n", strings.Join(addrs, ", "))
 	fmt.Println("========================================")
 	fmt.Println("  Endpoints:")
 	fmt.Println("    POST /api/generate-seed")
@@ -831,6 +1331,7 @@ func main() {
 	fmt.Println("    POST /api/wallet/{name}/newaddress")
 	fmt.Println("    GET  /api/wallet/{name}/balance")
 	fmt.Println("    GET  /api/wallet/{name}/balances")
+	fmt.Println("    GET  /api/wallet/{name}/listunspent")
 	fmt.Println("    GET  /api/wallets")
 	fmt.Println("  Transaction Service (read-only):")
 	fmt.Println("    GET  /api/chain/{coin}/balance/{address}")
@@ -838,10 +1339,20 @@ func main() {
 	fmt.Println("    GET  /api/chain/{coin}/validate/{address}")
 	fmt.Println("    GET  /api/chain/{coin}/history/{address}")
 	fmt.Println("    POST /api/chain/{coin}/estimate (from,to,amount) -> fee/change")
+	fmt.Println("    GET  /api/chain/{coin}/gasbalance/{address}  (BSC USDT: BNB wei + balance)")
+	fmt.Println("    POST /api/chain/{coin}/send  BEP-20: {from,to,tokenAmount,gasPriceWei?,privateKey?}")
 	fmt.Println("    POST /api/chain/{coin}/send     (requires X-Api-Key)")
 	fmt.Println("========================================")
 
-	log.Fatal(http.ListenAndServe(addr, nil))
+	for _, a := range addrs {
+		go func(a string) {
+			log.Printf("listening on %s", a)
+			if err := http.ListenAndServe(a, nil); err != nil {
+				log.Fatalf("listen %s: %v", a, err)
+			}
+		}(a)
+	}
+	select {}
 }
 
 func getEnv(key, fallback string) string {
