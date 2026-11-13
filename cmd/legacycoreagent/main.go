@@ -1275,7 +1275,7 @@ func main() {
 
 	signer := getEnv("LEGACYCOIN_SIGNER_URL", "http://127.0.0.1:8053")
 	hotWallet := getEnv("LEGACYCOIN_HOT_WALLET", "exchange")
-	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetNodeWallet(hotWallet).SetSignerURL(signer))
+	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetNodeWallet(hotWallet).SetSignerURL(signer).SetCookieDir(dataDir))
 	svc.chains.Register(txsvc.NewKaspaRest("KAS", "https://api.kaspa.org").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("GOR", "https://api.gor.forks.life").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("BTM", "https://api.btm.forks.life").SetSignerURL(signer))

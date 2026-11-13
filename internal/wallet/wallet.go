@@ -823,6 +823,14 @@ func (w *Wallet) SendToAddressFromAddrs(chain *blockchain.Chain, pool *mempool.P
 // required and must be wallet-owned. It returns the swept amount as well, which
 // callers need because the amount is a derived value (total-fee) rather than
 // something the caller supplied.
+// sweepBatchInputs — максимум входов в одной sweep-транзакции: при ~148Б на
+// вход 600 входов укладываются в стандартный лимит мемпола с запасом.
+const sweepBatchInputs = 600
+
+// Sweep consolidates one wallet-owned address into `to` with no change.
+// When the address holds more inputs than fit one standard transaction,
+// the sweep is split into several sequential transactions; the returned
+// txid is the last one (all batches are broadcast before it returns).
 func (w *Wallet) Sweep(chain *blockchain.Chain, pool *mempool.Pool, from string, to string, fee int64) (string, int64, error) {
 	if from == "" {
 		return "", 0, fmt.Errorf("bad source address")
@@ -837,23 +845,52 @@ func (w *Wallet) Sweep(chain *blockchain.Chain, pool *mempool.Pool, from string,
 	if err != nil {
 		return "", 0, err
 	}
-	total := int64(0)
-	for _, u := range unspent {
-		if u.Locked || u.Address != from {
-			continue
+	eligible := func(us []UTXOView) (int, int64) {
+		n, v := 0, int64(0)
+		for _, u := range us {
+			if u.Locked || u.Address != from {
+				continue
+			}
+			if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
+				continue
+			}
+			n++
+			v += u.Value
 		}
-		if u.Coinbase && u.Confirmations > 0 && u.Confirmations < int32(chaincfg.CoinbaseMaturity) {
-			continue
+		return n, v
+	}
+	total, count := int64(0), 0
+	count, total = eligible(unspent)
+	if count == 0 {
+		return "", 0, fmt.Errorf("no spendable inputs for %s", from)
+	}
+	// Каждый батч — отдельная транзакция: sendWithSources ограничивает выбор
+	// sweepBatchInputs входами, потраченные выходы выпадают из unspent, так
+	// что цикл естественно съедает остаток. fees — сумма комиссий всех батчей.
+	var lastTxid string
+	fees := int64(0)
+	prevRemaining := total
+	for batch := 0; batch < 200; batch++ {
+		txid, effFee, err := w.sendWithSource(chain, pool, from, to, 0, fee, nil, true)
+		if err != nil {
+			return lastTxid, total - fees, fmt.Errorf("sweep batch %d: %w", batch+1, err)
 		}
-		total += u.Value
+		lastTxid = txid
+		fees += effFee
+		unspent, err = w.ListUnspentForSpend(chain, pool)
+		if err != nil {
+			return lastTxid, total - fees, err
+		}
+		remaining, remainingVal := eligible(unspent)
+		if remaining == 0 {
+			return lastTxid, total - fees, nil
+		}
+		if remainingVal >= prevRemaining {
+			return lastTxid, total - fees, fmt.Errorf("sweep stalled: %d inputs (val %d) not consumed", remaining, remainingVal)
+		}
+		prevRemaining = remainingVal
 	}
-	txid, effFee, err := w.sendWithSource(chain, pool, from, to, 0, fee, nil, true)
-	if err != nil {
-		return "", 0, err
-	}
-	// effFee is the fee the transaction actually pays, which differs from the
-	// requested fee when the caller left it at zero and auto-fee took over.
-	return txid, total - effFee, nil
+	return lastTxid, total - fees, fmt.Errorf("sweep exceeded batch limit")
 }
 
 func (w *Wallet) SendMany(chain *blockchain.Chain, pool *mempool.Pool, from string, outputs map[string]int64, fee int64) (string, int64, error) {
@@ -1227,6 +1264,17 @@ func (w *Wallet) sendWithSources(chain *blockchain.Chain, pool *mempool.Pool, fr
 	w.mu.RUnlock()
 	if len(selected) == 0 {
 		return "", 0, fmt.Errorf("no spendable wallet inputs: pending transactions already lock selected wallet inputs")
+	}
+	if sweep && len(selected) > sweepBatchInputs {
+		// Стандартный лимит размера транзакции в мемполе (~100KB) не даёт
+		// потратить сотни входов одной транзакцией. Sweeper (Wallet.Sweep)
+		// нарезает остаток на несколько транзакций: за один вызов уходим
+		// максимум на sweepBatchInputs входов, пересчитывая total.
+		selected = selected[:sweepBatchInputs]
+		total = 0
+		for _, c := range selected {
+			total += c.utxo.Value
+		}
 	}
 	if sweep {
 		// Every spendable input is consumed, so the fee is the only thing left

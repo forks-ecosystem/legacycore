@@ -21,6 +21,7 @@ type LBTC struct {
 	rpcUser   string
 	rpcPass   string
 	hotRPC    *RPCClient
+	cookieDir string // datadir с .cookie; прокидывается в новые клиенты
 	signerURL string
 }
 
@@ -43,7 +44,10 @@ func (b *LBTC) SetNodeWallet(wallet string) *LBTC {
 		b.hotRPC = nil
 		return b
 	}
-	b.hotRPC = NewRPCClient(b.rpcURL, b.rpcUser, b.rpcPass).WithWallet(wallet)
+	// cookieDir должен пережить пересоздание клиента: WithNodeWallet вызывает
+	// SetNodeWallet на копии цепочки для каждого send с wallet-override, и без
+	// этого hotRPC терял cookie-авторизацию (401 на sweepallraw/sendtoaddress).
+	b.hotRPC = NewRPCClient(b.rpcURL, b.rpcUser, b.rpcPass).WithWallet(wallet).WithCookieDir(b.cookieDir)
 	return b
 }
 
@@ -55,6 +59,19 @@ func (b *LBTC) WithNodeWallet(wallet string) *LBTC {
 	cp := *b
 	cp.SetNodeWallet(wallet)
 	return &cp
+}
+
+// SetCookieDir points the chain's RPC clients at the node datadir holding
+// .cookie, so a cookie-only node (no static rpcuser/rpcpassword in
+// legacycoin.conf) is served: on auth failure the clients re-read the cookie.
+// Must be called before serving traffic.
+func (b *LBTC) SetCookieDir(dir string) *LBTC {
+	b.cookieDir = dir
+	b.rpc = b.rpc.WithCookieDir(dir)
+	if b.hotRPC != nil {
+		b.hotRPC = b.hotRPC.WithCookieDir(dir)
+	}
+	return b
 }
 
 // sendRPC is the client used for wallet-scoped spend/balance RPCs.

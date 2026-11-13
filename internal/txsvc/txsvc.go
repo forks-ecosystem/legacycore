@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -172,10 +174,11 @@ func (m *Manager) Names() []string {
 // RPC (token bucket per client IP), so callers retry with a 1s delay.
 type RPCClient struct {
 	url      string
-	user     string
-	pass     string
-	wallet   string
-	attempts int
+	user      string
+	pass      string
+	wallet    string
+	attempts  int
+	cookieDir string
 }
 
 func NewRPCClient(url, user, pass string) *RPCClient {
@@ -191,6 +194,33 @@ func (c *RPCClient) WithWallet(wallet string) *RPCClient {
 	cp := *c
 	cp.wallet = wallet
 	return &cp
+}
+
+// WithCookieDir points the client at the node datadir holding .cookie. When the
+// node runs cookie-only (no static rpcuser/rpcpassword), the cookie is the
+// credential source; the file is re-read per failed attempt so a node restart
+// that rotates it is picked up without restarting the agent.
+func (c *RPCClient) WithCookieDir(dir string) *RPCClient {
+	cp := *c
+	cp.cookieDir = dir
+	return &cp
+}
+
+// readCookieAuth returns the "user", "pass" pair from a datadir .cookie
+// (format __cookie__:salt:pass). Empty strings when absent or malformed.
+func readCookieAuth(dir string) (string, string) {
+	if dir == "" {
+		return "", ""
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, ".cookie"))
+	if err != nil {
+		return "", ""
+	}
+	parts := strings.SplitN(strings.TrimSpace(string(raw)), ":", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return "", ""
+	}
+	return parts[0], parts[1]
 }
 
 func (c *RPCClient) Call(method string, params any) (any, error) {
@@ -210,6 +240,24 @@ func (c *RPCClient) callOnce(method string, params any) (any, error) {
 	if c.url == "" {
 		return nil, fmt.Errorf("RPC not configured")
 	}
+	user, pass := c.user, c.pass
+	if user == "" {
+		user, pass = readCookieAuth(c.cookieDir)
+	}
+	res, err := c.callOnceAuth(method, params, user, pass)
+	if err == nil {
+		return res, nil
+	}
+	// The attempt above used static credentials (or none, when the node is
+	// cookie-only and the cookie was unreadable). Retry once with a fresh read
+	// of the datadir .cookie — it may have rotated or just been created.
+	if cu, cpw := readCookieAuth(c.cookieDir); cu != "" && !(cu == user && cpw == pass) {
+		return c.callOnceAuth(method, params, cu, cpw)
+	}
+	return nil, err
+}
+
+func (c *RPCClient) callOnceAuth(method string, params any, user, pass string) (any, error) {
 	reqBody := map[string]any{"method": method, "params": params, "id": 1}
 	body, _ := json.Marshal(reqBody)
 	req, _ := http.NewRequest("POST", c.url, bytes.NewReader(body))
@@ -217,8 +265,8 @@ func (c *RPCClient) callOnce(method string, params any) (any, error) {
 	if c.wallet != "" {
 		req.Header.Set("X-LegacyCoin-Wallet", c.wallet)
 	}
-	if c.user != "" {
-		req.SetBasicAuth(c.user, c.pass)
+	if user != "" {
+		req.SetBasicAuth(user, pass)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -231,7 +279,7 @@ func (c *RPCClient) callOnce(method string, params any) (any, error) {
 		Error  any `json:"error"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rpc %s: http %d: %.120s", method, resp.StatusCode, respBody)
 	}
 	if result.Error != nil {
 		return nil, fmt.Errorf("%v", result.Error)
