@@ -923,7 +923,7 @@ func (s *Service) handleChain(w http.ResponseWriter, r *http.Request) {
 	case "send":
 		s.handleChainSend(w, r, chain, rest, coin)
 	case "rpc":
-		s.handleChainRPC(w, r, coin)
+		s.handleChainRPC(w, r, coin, chain)
 	default:
 		jsonErr(w, 400, "unknown op "+op)
 	}
@@ -952,13 +952,15 @@ var rpcForbiddenMethods = map[string]bool{
 	"stop": true,
 }
 
-func (s *Service) handleChainRPC(w http.ResponseWriter, r *http.Request, coin string) {
+func (s *Service) handleChainRPC(w http.ResponseWriter, r *http.Request, coin string, chain txsvc.Blockchain) {
 	if r.Method != http.MethodPost {
 		jsonErr(w, 405, "rpc requires POST")
 		return
 	}
-	if coin != "lbtc" {
-		jsonErr(w, 404, "rpc pass-through is only served for the node-backed chain (lbtc)")
+	// Only node-backed chains have a JSON-RPC surface to proxy: lbtc (the
+	// agent's own RPC client) and rvn (adapter RPCPassThrough).
+	if coin != "lbtc" && coin != "rvn" {
+		jsonErr(w, 404, "rpc pass-through is only served for node-backed chains (lbtc, rvn)")
 		return
 	}
 	if s.apiKey == "" {
@@ -992,13 +994,25 @@ func (s *Service) handleChainRPC(w http.ResponseWriter, r *http.Request, coin st
 	if params == nil {
 		params = []any{}
 	}
-	result, err := s.rpcCallOnceWallet(req.Method, params, req.Wallet)
+
+	var result any
+	var err error
+	if coin == "rvn" {
+		pt, ok := chain.(txsvc.RPCPassThrough)
+		if !ok {
+			jsonErr(w, 503, "rvn rpc pass-through is not available")
+			return
+		}
+		result, err = pt.RPCPassThrough(method, params)
+	} else {
+		result, err = s.rpcCallOnceWallet(method, params, req.Wallet)
+	}
 	if err != nil {
 		jsonErr(w, 502, err.Error())
 		return
 	}
-	log.Printf("chain rpc pass-through: %s wallet=%q", method, req.Wallet)
-	jsonResp(w, 200, map[string]any{"method": req.Method, "wallet": req.Wallet, "result": result})
+	log.Printf("chain rpc pass-through: %s coin=%s wallet=%q", method, coin, req.Wallet)
+	jsonResp(w, 200, map[string]any{"method": req.Method, "coin": coin, "wallet": req.Wallet, "result": result})
 }
 
 func (s *Service) handleChainBalance(w http.ResponseWriter, chain txsvc.Blockchain, address string) {
@@ -1276,6 +1290,14 @@ func main() {
 	signer := getEnv("LEGACYCOIN_SIGNER_URL", "http://127.0.0.1:8053")
 	hotWallet := getEnv("LEGACYCOIN_HOT_WALLET", "exchange")
 	svc.chains.Register(txsvc.NewLBTC(svc.rpcURL, svc.rpcUser, svc.rpcPass).SetNodeWallet(hotWallet).SetSignerURL(signer).SetCookieDir(dataDir))
+	// Ravencoin: docker rvn-core (ravend, mainnet), static RPC creds —
+	// /home/coin/rvn-core-server-docker. Node-owned addresses via the node
+	// wallet; sends are signed by the node itself (SendTransaction).
+	svc.chains.Register(txsvc.NewRVN(
+		getEnv("RVN_RPC_URL", "http://127.0.0.1:8766"),
+		getEnv("RVN_RPC_USER", ""),
+		getEnv("RVN_RPC_PASSWORD", ""),
+	).SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("KAS", "https://api.kaspa.org").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("GOR", "https://api.gor.forks.life").SetSignerURL(signer))
 	svc.chains.Register(txsvc.NewKaspaRest("BTM", "https://api.btm.forks.life").SetSignerURL(signer))
