@@ -359,13 +359,6 @@ func (b *RVN) GetTransaction(txid string) (*Tx, error) {
 	return tx, nil
 }
 
-// SignAndSend is not implemented: the exchange flow for RVN is node-owned
-// wallets (SendTransaction). External-key self-custody sends come later if a
-// use case appears.
-func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
-	return SendResult{}, ErrNotImplemented
-}
-
 // Estimate implements the optional Estimator hook for /api/chain/rvn/estimate:
 // dry-run input selection against the from-address UTXOs and minimum relay fee.
 func (b *RVN) Estimate(from, to string, amount int64) (FeeEstimate, error) {
@@ -411,6 +404,88 @@ func (b *RVN) Estimate(from, to string, amount int64) (FeeEstimate, error) {
 // agent handler before this is reached.
 func (b *RVN) RPCPassThrough(method string, params []any) (any, error) {
 	return b.rpc.Call(strings.ToLower(strings.TrimSpace(method)), params)
+}
+
+// SignAndSend is the agent's send route for node-owned wallets: keys never
+// leave the node, so privateKey is refused by design. With a wallet-owned
+// `from`:
+//   all=true  → sweep: every confirmed UTXO of `from` becomes one output to
+//               `to` (sendtoaddress with subtractfeefromamount, so no change
+//               output is left behind — the ravend analogue of sweepallraw).
+//   otherwise → sendtoaddress(to, amount). ravend has no per-send fee
+//               parameter; a requested fee is advisory, the actually paid fee
+//               is read back from gettransaction and reported in the result.
+func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
+	var res SendResult
+	if privateKey != "" {
+		return res, fmt.Errorf("RVN uses node-owned wallets: private keys are not accepted")
+	}
+	if from == "" || to == "" {
+		return res, fmt.Errorf("from and to are required")
+	}
+	if info, err := b.ValidateAddress(to); err != nil {
+		return res, err
+	} else if !info.IsValid {
+		return res, fmt.Errorf("invalid destination address: %s", to)
+	}
+	if info, err := b.ValidateAddress(from); err != nil {
+		return res, err
+	} else if !info.IsValid {
+		return res, fmt.Errorf("invalid source address: %s", from)
+	} else if !info.IsMine {
+		return res, fmt.Errorf("source address is not owned by the node wallet: %s", from)
+	}
+
+	var sendAmt int64
+	subtractFee := false
+	if len(all) > 0 && all[0] {
+		rows, err := b.listAddressUTXOs(from, 1)
+		if err != nil {
+			return res, err
+		}
+		var total int64
+		for _, m := range rows {
+			if v, ok := m["amount"].(float64); ok {
+				total += rvnFromFloat(v)
+			}
+		}
+		if total <= 0 {
+			return res, fmt.Errorf("no confirmed balance to sweep from %s", from)
+		}
+		// Whole balance in one output: the recipient gets total minus the real
+		// network fee. A requested fee is folded into that subtraction by the
+		// node itself; asking for a fee above the balance is meaningless here.
+		sendAmt = total
+		subtractFee = true
+	} else {
+		if amount <= 0 {
+			return res, fmt.Errorf("amount must be positive")
+		}
+		sendAmt = amount
+	}
+
+	res.Amount = sendAmt
+	res.Fee = fee
+	raw, err := b.rpc.Call("sendtoaddress", []any{
+		to, formatRVNTx(sendAmt), "forkex", "withdrawal", subtractFee,
+	})
+	if err != nil {
+		return res, fmt.Errorf("sendtoaddress: %v", err)
+	}
+	txid, ok := raw.(string)
+	if !ok || txid == "" {
+		return res, fmt.Errorf("unexpected sendtoaddress result: %v", raw)
+	}
+	res.Txid = txid
+
+	// Read back the actual fee: ravend bills what its feerate produced, not
+	// what the caller suggested.
+	if tx, err := b.GetTransaction(txid); err == nil && tx != nil {
+		if tx.Fee != 0 {
+			res.Fee = -tx.Fee // wallet reports fee as a negative amount
+		}
+	}
+	return res, nil
 }
 
 var _ Blockchain = (*RVN)(nil)
