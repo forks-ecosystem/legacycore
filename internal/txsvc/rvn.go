@@ -13,10 +13,19 @@ package txsvc
 // node — no cookie handling needed.
 
 import (
+	"bytes"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
 	"sync"
+
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcd/btcec/v2"
 )
 
 type RVN struct {
@@ -474,9 +483,6 @@ func (b *RVN) RPCPassThrough(method string, params []any) (any, error) {
 //               is read back from gettransaction and reported in the result.
 func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string, all ...bool) (SendResult, error) {
 	var res SendResult
-	if privateKey != "" {
-		return res, fmt.Errorf("RVN uses node-owned wallets: private keys are not accepted")
-	}
 	if from == "" || to == "" {
 		return res, fmt.Errorf("from and to are required")
 	}
@@ -485,6 +491,15 @@ func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string,
 	} else if !info.IsValid {
 		return res, fmt.Errorf("invalid destination address: %s", to)
 	}
+
+	isAll := len(all) > 0 && all[0]
+
+	// --- Внешняя подпись (self-custody): ключ у вызывающего. ---
+	if privateKey != "" {
+		return b.signExternal(from, to, amount, fee, privateKey, isAll)
+	}
+
+	// --- Node-owned: ключи в кошельке ноды (существующий путь). ---
 	if info, err := b.ValidateAddress(from); err != nil {
 		return res, err
 	} else if !info.IsValid {
@@ -495,7 +510,7 @@ func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string,
 
 	var sendAmt int64
 	subtractFee := false
-	if len(all) > 0 && all[0] {
+	if isAll {
 		rows, err := b.listAddressUTXOs(from, 1)
 		if err != nil {
 			return res, err
@@ -509,9 +524,6 @@ func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string,
 		if total <= 0 {
 			return res, fmt.Errorf("no confirmed balance to sweep from %s", from)
 		}
-		// Whole balance in one output: the recipient gets total minus the real
-		// network fee. A requested fee is folded into that subtraction by the
-		// node itself; asking for a fee above the balance is meaningless here.
 		sendAmt = total
 		subtractFee = true
 	} else {
@@ -534,15 +546,188 @@ func (b *RVN) SignAndSend(from, to string, amount, fee int64, privateKey string,
 		return res, fmt.Errorf("unexpected sendtoaddress result: %v", raw)
 	}
 	res.Txid = txid
-
-	// Read back the actual fee: ravend bills what its feerate produced, not
-	// what the caller suggested.
-	if tx, err := b.GetTransaction(txid); err == nil && tx != nil {
-		if tx.Fee != 0 {
-			res.Fee = -tx.Fee // wallet reports fee as a negative amount
-		}
+	if tx, err := b.GetTransaction(txid); err == nil && tx != nil && tx.Fee != 0 {
+		res.Fee = -tx.Fee
 	}
 	return res, nil
+}
+
+// signExternal строит, подписывает (WIF приватным ключом вызывающего) и
+// бродкастит P2PKH-транзакцию RVN. UTXO берутся из ноды (адрес должен быть
+// известен ноде — авто-импорт watch-only обеспечивает это).
+func (b *RVN) signExternal(from, to string, amount, fee int64, privateKey string, isAll bool) (SendResult, error) {
+	var res SendResult
+
+	wif, err := btcutil.DecodeWIF(privateKey)
+	var privKey *btcec.PrivateKey
+	compress := true
+	if err != nil {
+		hexBytes, herr := hex.DecodeString(strings.TrimPrefix(privateKey, "0x"))
+		if herr != nil || len(hexBytes) != 32 {
+			return res, fmt.Errorf("invalid private key: %v", err)
+		}
+		pk, _ := btcec.PrivKeyFromBytes(hexBytes)
+		privKey = pk
+		compress = true
+	} else {
+		privKey = wif.PrivKey
+		compress = wif.CompressPubKey
+	}
+
+	fromAddr, err := btcutil.DecodeAddress(from, rvnChainParams)
+	if err != nil {
+		return res, fmt.Errorf("invalid source address: %v", err)
+	}
+	toAddr, err := btcutil.DecodeAddress(to, rvnChainParams)
+	if err != nil {
+		return res, fmt.Errorf("invalid destination address: %v", err)
+	}
+
+	// Убедимся, что нода знает UTXO адреса (watch-only авто-импорт).
+	b.ensureWatched(from)
+	utxos, err := b.ListUnspent(from, 1)
+	if err != nil {
+		return res, fmt.Errorf("listunspent: %v", err)
+	}
+	if len(utxos) == 0 {
+		return res, fmt.Errorf("no confirmed UTXOs available for %s (rescan may still be running)", from)
+	}
+
+	// Отбор входов.
+	var selected []UTXO
+	var total int64
+	if isAll {
+		selected = append([]UTXO(nil), utxos...)
+		for _, u := range selected {
+			total += u.Value
+		}
+	} else {
+		if amount <= 0 {
+			return res, fmt.Errorf("amount must be positive")
+		}
+		needed := amount
+		if fee > 0 {
+			needed += fee
+		}
+		sorted := append([]UTXO(nil), utxos...)
+		// largest-first
+		for i := 0; i < len(sorted); i++ {
+			for j := i + 1; j < len(sorted); j++ {
+				if sorted[j].Value > sorted[i].Value {
+					sorted[i], sorted[j] = sorted[j], sorted[i]
+				}
+			}
+		}
+		for _, u := range sorted {
+			selected = append(selected, u)
+			total += u.Value
+			if total >= needed {
+				break
+			}
+		}
+		if total < needed {
+			return res, fmt.Errorf("insufficient balance: have %d, need %d", total, needed)
+		}
+	}
+
+	// Комиссия: relayfee ноды 0.01 RVN/KB → минимум 0.01 RVN за транзакцию
+	// (нода отклоняет «min relay fee not met» для меньших сумм).
+	if fee <= 0 {
+		size := 10 + 148*len(selected) + 34*2
+		fee = 1000 * int64(size) // 0.00001 RVN/byte ≈ 0.01 RVN/KB
+		if fee < 1000000 {
+			fee = 1000000
+		}
+	}
+	sendAmt := amount
+	if isAll {
+		sendAmt = total - fee
+		if sendAmt <= 0 {
+			return res, fmt.Errorf("fee %d consumes the whole balance %d", fee, total)
+		}
+	} else {
+		if amount <= 0 {
+			return res, fmt.Errorf("amount must be positive")
+		}
+	}
+	if isAll {
+		res.Amount = sendAmt
+	} else {
+		res.Amount = amount
+	}
+	res.Fee = fee
+
+	// Построение транзакции.
+	tx := wire.NewMsgTx(wire.TxVersion)
+	for _, u := range selected {
+		h, err := chainhash.NewHashFromStr(u.Txid)
+		if err != nil {
+			return res, fmt.Errorf("bad txid %s: %v", u.Txid, err)
+		}
+		tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(h, u.Vout), nil, nil))
+	}
+	outScript, err := txscript.PayToAddrScript(toAddr)
+	if err != nil {
+		return res, fmt.Errorf("paytoaddr (to): %v", err)
+	}
+	tx.AddTxOut(wire.NewTxOut(sendAmt, outScript))
+
+	change := total - sendAmt - fee
+	if change >= 5460 {
+		changeScript, err := txscript.PayToAddrScript(fromAddr)
+		if err != nil {
+			return res, fmt.Errorf("paytoaddr (change): %v", err)
+		}
+		tx.AddTxOut(wire.NewTxOut(change, changeScript))
+	} else if change > 0 {
+		// пыль уходит в комиссию
+		fee = total - sendAmt
+		res.Fee = fee
+	}
+
+	// Подпись каждого входа.
+	for i, u := range selected {
+		pkScript, err := hex.DecodeString(u.ScriptHex)
+		if err != nil || len(pkScript) == 0 {
+			return res, fmt.Errorf("missing scriptPubKey for input %d", i)
+		}
+		sig, err := txscript.SignatureScript(tx, i, pkScript, txscript.SigHashAll, privKey, compress)
+		if err != nil {
+			return res, fmt.Errorf("sign input %d: %v", i, err)
+		}
+		tx.TxIn[i].SignatureScript = sig
+	}
+
+	// Сериализация.
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		return res, fmt.Errorf("serialize: %v", err)
+	}
+	rawHex := hex.EncodeToString(buf.Bytes())
+
+	// Бродкаст.
+	raw, err := b.rpc.Call("sendrawtransaction", []any{rawHex})
+	if err != nil {
+		return res, fmt.Errorf("sendrawtransaction: %v", err)
+	}
+	txid, ok := raw.(string)
+	if !ok || txid == "" {
+		return res, fmt.Errorf("unexpected sendrawtransaction result: %v", raw)
+	}
+	res.Txid = txid
+	res.RawTx = rawHex
+	res.Size = tx.SerializeSize()
+	return res, nil
+}
+
+var rvnChainParams = &chaincfg.Params{
+	Name:              "ravencoin",
+	Net:               0xd9b4bef9, // Ravencoin mainnet magic (best-effort; signing doesn't use it)
+	PubKeyHashAddrID:  0x3c,
+	ScriptHashAddrID:  0x7a,
+	PrivateKeyID:      0x80,
+	WitnessPubKeyHashAddrID: 0x06, // unused (no segwit)
+	WitnessScriptHashAddrID:  0x0a, // unused
 }
 
 var _ Blockchain = (*RVN)(nil)
