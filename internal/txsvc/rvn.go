@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 )
 
 type RVN struct {
@@ -81,11 +82,66 @@ func (b *RVN) listAddressUTXOs(address string, minConf int) ([]map[string]any, e
 	return rows, nil
 }
 
+// --- watch-only tracking for arbitrary (self-custody) addresses ---
+//
+// ravend по умолчанию не знает чужих адресов, поэтому getreceivedbyaddress
+// и listunspent для них возвращают 0. importaddress (без rescan) добавляет
+// адрес в кошелёк как watch-only; затем rescanblockchain подхватывает его
+// транзакции. Авто-импорт срабатывает при первом запросе баланса чужого
+// адреса — баланс появится после завершения фонового rescana (~минуты).
+var rvnWatched sync.Map
+var rvnRescanMu sync.Mutex
+
+// ensureWatched импортирует чужой адрес как watch-only (если ещё не импортирован)
+// и запускает фоновый rescan последних блоков. Идемпотентно.
+func (b *RVN) ensureWatched(addr string) {
+	if addr == "" {
+		return
+	}
+	if _, ok := rvnWatched.Load(addr); ok {
+		return
+	}
+	info, err := b.ValidateAddress(addr)
+	if err != nil || !info.IsValid {
+		return
+	}
+	if info.IsMine {
+		rvnWatched.Store(addr, true)
+		return
+	}
+	// importaddress может вернуть ошибку "already have address" — это нормально.
+	_, _ = b.rpc.Call("importaddress", []any{addr, "watch", false})
+	rvnWatched.Store(addr, true)
+
+	// Фоновый rescan: берём последние ~200k блоков (~140 дней для RVN).
+	go func() {
+		rvnRescanMu.Lock()
+		defer rvnRescanMu.Unlock()
+		tipRes, err := b.rpc.Call("getblockcount", []any{})
+		if err != nil {
+			return
+		}
+		tip, ok := tipRes.(float64)
+		if !ok {
+			return
+		}
+		start := int(tip) - 200000
+		if start < 1 {
+			start = 1
+		}
+		_, _ = b.rpc.Call("rescanblockchain", []any{start, int(tip)})
+	}()
+}
+
+// GetBalance — для собственных адресов ноды (ismine) считается из
+// listunspent/getreceivedbyaddress; для чужих сначала авто-импортируется
+// watch-only адрес (ensureWatched) и возвращается то, что уже известно ноде.
 func (b *RVN) GetBalance(address string) (Balance, error) {
 	var bal Balance
 	if address == "" {
 		return bal, fmt.Errorf("address is required")
 	}
+	b.ensureWatched(address)
 	rows, err := b.listAddressUTXOs(address, 1)
 	if err != nil {
 		return bal, err
@@ -113,6 +169,7 @@ func (b *RVN) GetBalance(address string) (Balance, error) {
 }
 
 func (b *RVN) ListUnspent(address string, minConf int) ([]UTXO, error) {
+	b.ensureWatched(address)
 	rows, err := b.listAddressUTXOs(address, minConf)
 	if err != nil {
 		return nil, err
